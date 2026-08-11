@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// `Mem8Error::Store`. This trait is the only place that knows about
 /// persistence — `core` above it contains no SQL.
 #[async_trait]
-pub trait Store: Send + Sync + std::fmt::Debug {
+pub trait Store: Send + Sync {
     async fn add(&self, new: NewMemory) -> Result<Memory>;
     async fn get(&self, id: Uuid) -> Result<Memory>;
     async fn update(&self, id: Uuid, update: MemoryUpdate) -> Result<Memory>;
@@ -34,7 +34,6 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 /// while the lock is held would poison it and fail every later call on the
 /// same instance. The real backends carry the availability requirement that
 /// a store failure must not end the session.
-#[derive(Debug)]
 pub struct MemStore {
     rows: Mutex<Vec<Memory>>,
 }
@@ -255,7 +254,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_url_scheme_is_an_error() {
-        let err = open_from_url("mysql://localhost/db").await.unwrap_err();
-        assert!(err.to_string().contains("mysql"));
+        let result = open_from_url("mysql://localhost/db").await;
+        let message = match result {
+            Ok(_) => panic!("expected an error for an unsupported URL scheme"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains("mysql"),
+            "error should name the offending scheme, got: {message}"
+        );
     }
 }
