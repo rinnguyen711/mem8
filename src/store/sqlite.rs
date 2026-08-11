@@ -219,9 +219,7 @@ impl Store for SqliteStore {
             sql.push_str(&format!(" AND m.kind = ?{}", binds.len()));
         }
 
-        sql.push_str(" ORDER BY score LIMIT ?");
-        binds.push(Box::new(query.limit as i64));
-        sql.push_str(&binds.len().to_string());
+        sql.push_str(" ORDER BY score");
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(store_err)?;
@@ -238,10 +236,13 @@ impl Store for SqliteStore {
 
         // Tag filtering happens here rather than in SQL: tags are stored as a
         // JSON string in SQLite, so an AND-across-tags predicate is clearer in
-        // Rust than in nested json_each subqueries.
+        // Rust than in nested json_each subqueries. LIMIT is intentionally not
+        // in the SQL above — it must apply AFTER this filter, matching
+        // MemStore's semantics: apply every filter, then truncate to `limit`.
         Ok(rows
             .into_iter()
             .filter(|hit| query.tags.iter().all(|t| hit.memory.tags.contains(t)))
+            .take(query.limit)
             .collect())
     }
 
@@ -274,6 +275,15 @@ mod tests {
             kind: Kind::Decision,
             content: content.into(),
             tags: vec!["rust".into()],
+        }
+    }
+
+    fn new_memory_with_tags(project: &str, content: &str, tags: Vec<&str>) -> NewMemory {
+        NewMemory {
+            project: project.into(),
+            kind: Kind::Decision,
+            content: content.into(),
+            tags: tags.into_iter().map(String::from).collect(),
         }
     }
 
@@ -332,5 +342,29 @@ mod tests {
         let added = s.add(new_memory("p1", "we chose rust")).await.unwrap();
         s.delete(added.id).await.unwrap();
         assert!(s.search(query("rust", "p1")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tag_filter_applies_before_limit() {
+        let s = store();
+
+        // 5 memories all match the FTS word "widget". Only 3 carry "keep";
+        // the other 2 carry "drop". A naive impl applies SQL LIMIT (3) first,
+        // then filters by tag in Rust, which can strip tagged rows that never
+        // made it past the SQL limit and under-return. The correct semantic
+        // (matching MemStore) is: filter by tag first, then limit to 3.
+        s.add(new_memory_with_tags("p1", "widget one", vec!["drop"])).await.unwrap();
+        s.add(new_memory_with_tags("p1", "widget two", vec!["drop"])).await.unwrap();
+        s.add(new_memory_with_tags("p1", "widget three", vec!["keep"])).await.unwrap();
+        s.add(new_memory_with_tags("p1", "widget four", vec!["keep"])).await.unwrap();
+        s.add(new_memory_with_tags("p1", "widget five", vec!["keep"])).await.unwrap();
+
+        let mut q = query("widget", "p1");
+        q.tags = vec!["keep".into()];
+        q.limit = 3;
+
+        let hits = s.search(q).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|h| h.memory.tags.contains(&"keep".to_string())));
     }
 }
