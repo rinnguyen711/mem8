@@ -45,6 +45,7 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
 END;
 "#;
 
+#[derive(Debug)]
 pub struct SqliteStore {
     conn: Mutex<Connection>,
 }

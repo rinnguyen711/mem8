@@ -25,6 +25,7 @@ CREATE INDEX IF NOT EXISTS idx_content_fts
     ON memories USING GIN (to_tsvector('english', content));
 "#;
 
+#[derive(Debug)]
 pub struct PgStore {
     pool: PgPool,
 }

@@ -5,7 +5,8 @@ use crate::error::{Mem8Error, Result};
 use crate::model::{Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery};
 use async_trait::async_trait;
 use chrono::Utc;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// Storage backend for memories.
@@ -14,7 +15,7 @@ use uuid::Uuid;
 /// `Mem8Error::Store`. This trait is the only place that knows about
 /// persistence — `core` above it contains no SQL.
 #[async_trait]
-pub trait Store: Send + Sync {
+pub trait Store: Send + Sync + std::fmt::Debug {
     async fn add(&self, new: NewMemory) -> Result<Memory>;
     async fn get(&self, id: Uuid) -> Result<Memory>;
     async fn update(&self, id: Uuid, update: MemoryUpdate) -> Result<Memory>;
@@ -33,6 +34,7 @@ pub trait Store: Send + Sync {
 /// while the lock is held would poison it and fail every later call on the
 /// same instance. The real backends carry the availability requirement that
 /// a store failure must not end the session.
+#[derive(Debug)]
 pub struct MemStore {
     rows: Mutex<Vec<Memory>>,
 }
@@ -129,6 +131,41 @@ impl Store for MemStore {
     }
 }
 
+/// Default SQLite location when `MEM8_DB` is unset.
+pub fn default_db_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mem8")
+        .join("mem8.db")
+}
+
+/// Open the backend named by a connection URL.
+pub async fn open_from_url(url: &str) -> Result<Arc<dyn Store>> {
+    if let Some(path) = url.strip_prefix("sqlite://") {
+        let store = sqlite::SqliteStore::open(std::path::Path::new(path))?;
+        return Ok(Arc::new(store));
+    }
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let store = postgres::PgStore::connect(url).await?;
+        return Ok(Arc::new(store));
+    }
+    Err(Mem8Error::InvalidInput(format!(
+        "unsupported MEM8_DB value '{url}'; expected a sqlite:// or postgres:// URL"
+    )))
+}
+
+/// Open the backend selected by `MEM8_DB`, defaulting to SQLite under the home
+/// directory.
+pub async fn open_from_env() -> Result<Arc<dyn Store>> {
+    match std::env::var("MEM8_DB") {
+        Ok(url) if !url.trim().is_empty() => open_from_url(&url).await,
+        _ => {
+            let store = sqlite::SqliteStore::open(&default_db_path())?;
+            Ok(Arc::new(store))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +223,39 @@ mod tests {
         let added = store.add(new_memory("p1", "use rust")).await.unwrap();
         store.delete(added.id).await.unwrap();
         assert!(store.get(added.id).await.is_err());
+    }
+
+    #[test]
+    fn default_path_is_under_home_dot_mem8() {
+        let path = default_db_path();
+        assert!(path.ends_with("mem8.db"));
+        assert!(path.to_string_lossy().contains(".mem8"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_url_opens_a_file_backend() {
+        let dir = std::env::temp_dir().join(format!("mem8-sel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        let url = format!("sqlite://{}", path.display());
+
+        let store = open_from_url(&url).await.unwrap();
+        store
+            .add(crate::model::NewMemory {
+                project: "p".into(),
+                kind: crate::model::Kind::Fact,
+                content: "persisted".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        assert!(path.exists(), "sqlite:// URL must create the database file");
+    }
+
+    #[tokio::test]
+    async fn unknown_url_scheme_is_an_error() {
+        let err = open_from_url("mysql://localhost/db").await.unwrap_err();
+        assert!(err.to_string().contains("mysql"));
     }
 }
