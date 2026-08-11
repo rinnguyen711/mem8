@@ -86,6 +86,21 @@ impl SqliteStore {
     }
 }
 
+/// Builds a `rusqlite::Error` that names the offending column and value, so a
+/// corrupt row surfaces as a diagnosable store error instead of being
+/// silently replaced with a fabricated default.
+fn column_parse_error(
+    column: &'static str,
+    bad_value: &str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        format!("invalid {column} value {bad_value:?}: {source}").into(),
+    )
+}
+
 fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
     let id: String = row.get("id")?;
     let kind: String = row.get("kind")?;
@@ -93,18 +108,27 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
     let created: String = row.get("created_at")?;
     let updated: String = row.get("updated_at")?;
 
+    let parsed_id =
+        Uuid::parse_str(&id).map_err(|e| column_parse_error("id", &id, e))?;
+    let parsed_kind =
+        Kind::from_str(&kind).map_err(|e| column_parse_error("kind", &kind, e))?;
+    let parsed_tags: Vec<String> = serde_json::from_str(&tags)
+        .map_err(|e| column_parse_error("tags", &tags, e))?;
+    let created_at = DateTime::parse_from_rfc3339(&created)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| column_parse_error("created_at", &created, e))?;
+    let updated_at = DateTime::parse_from_rfc3339(&updated)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| column_parse_error("updated_at", &updated, e))?;
+
     Ok(Memory {
-        id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+        id: parsed_id,
         project: row.get("project")?,
-        kind: Kind::from_str(&kind).unwrap_or(Kind::Fact),
+        kind: parsed_kind,
         content: row.get("content")?,
-        tags: serde_json::from_str(&tags).unwrap_or_default(),
-        created_at: DateTime::parse_from_rfc3339(&created)
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-        updated_at: DateTime::parse_from_rfc3339(&updated)
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
+        tags: parsed_tags,
+        created_at,
+        updated_at,
         embedding: None,
     })
 }
@@ -366,5 +390,25 @@ mod tests {
         let hits = s.search(q).await.unwrap();
         assert_eq!(hits.len(), 3);
         assert!(hits.iter().all(|h| h.memory.tags.contains(&"keep".to_string())));
+    }
+
+    #[tokio::test]
+    async fn corrupt_row_errors_instead_of_fabricating() {
+        let s = store();
+        let added = s.add(new_memory("p1", "we chose rust for the binary")).await.unwrap();
+
+        s.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET kind = 'banana' WHERE id = ?1",
+                params![added.id.to_string()],
+            )
+            .unwrap();
+
+        let result = s.get(added.id).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("banana"), "error message should mention the bad value: {msg}");
     }
 }
