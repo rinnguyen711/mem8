@@ -3,6 +3,14 @@ name = "mem8"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "mem8"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mem8"
+path = "src/main.rs"
+
 [dependencies]
 rmcp = { version = "0.9", features = ["server", "transport-io", "macros"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
