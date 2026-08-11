@@ -148,3 +148,17 @@ async fn sqlite_open_creates_the_database_file() {
     std::fs::remove_dir_all(cleanup_root).unwrap();
     assert!(!cleanup_root.exists());
 }
+
+/// Postgres is opt-in. Set `MEM8_TEST_PG` to a connection string to run this;
+/// a plain `cargo test` must pass with no database server running.
+#[tokio::test]
+async fn postgres_satisfies_the_store_contract() {
+    let Ok(url) = std::env::var("MEM8_TEST_PG") else {
+        eprintln!("skipping: MEM8_TEST_PG not set");
+        return;
+    };
+
+    let store = mem8::store::postgres::PgStore::connect(&url).await.unwrap();
+    store.reset_for_tests().await.unwrap();
+    run_contract(&store).await;
+}
