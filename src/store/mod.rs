@@ -250,6 +250,11 @@ mod tests {
             .unwrap();
 
         assert!(path.exists(), "sqlite:// URL must create the database file");
+
+        // Release the connection before removing the directory; Windows keeps
+        // the file locked while the handle is open.
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
