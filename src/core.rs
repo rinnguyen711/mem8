@@ -86,11 +86,15 @@ impl Memory8 {
         kind: Option<Kind>,
         tags: Option<Vec<String>>,
     ) -> Result<Memory> {
-        if let Some(c) = &content {
-            if c.trim().is_empty() {
+        // Trim here as `add` does, so a memory's stored content does not depend
+        // on which call wrote it.
+        let content = match content {
+            Some(c) if c.trim().is_empty() => {
                 return Err(Mem8Error::InvalidInput("content must not be empty".into()));
             }
-        }
+            Some(c) => Some(c.trim().to_string()),
+            None => None,
+        };
         self.store.update(id, MemoryUpdate { content, kind, tags }).await
     }
 
@@ -213,6 +217,22 @@ mod tests {
     #[test]
     fn sanitize_rejects_a_query_with_no_usable_terms() {
         assert!(sanitize_fts_query("\"\"()*").is_err());
+    }
+
+    #[tokio::test]
+    async fn update_trims_content_like_add_does() {
+        let svc = service();
+        let added = svc
+            .add("  spaced out  ", Kind::Fact, vec![], Some("p1".into()))
+            .await
+            .unwrap();
+        assert_eq!(added.content, "spaced out");
+
+        let updated = svc
+            .update(added.id, Some("  revised  ".into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(updated.content, "revised");
     }
 
     #[tokio::test]
