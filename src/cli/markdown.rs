@@ -1,17 +1,31 @@
 use crate::error::{Mem8Error, Result};
 use crate::model::{Kind, Memory, NewMemory};
 use std::str::FromStr;
+use uuid::Uuid;
+
+/// True when `line` is a section heading, i.e. `## ` followed by a
+/// UUID-shaped token. Content lines that merely start with `## ` (a heading
+/// the user typed as part of a memory's body) do not match this shape, so
+/// they cannot be mistaken for a new section by `from_markdown`. This is
+/// what makes the section boundary unambiguous without needing to escape
+/// user content on write.
+fn is_section_heading(line: &str) -> bool {
+    line.strip_prefix("## ")
+        .map(|rest| Uuid::parse_str(rest.trim()).is_ok())
+        .unwrap_or(false)
+}
 
 /// Serialise memories to markdown, one section per memory.
 pub fn to_markdown(memories: &[Memory]) -> String {
     let mut out = String::from("# mem8 export\n\n");
     for m in memories {
+        let tags_json = serde_json::to_string(&m.tags).unwrap_or_else(|_| "[]".to_string());
         out.push_str(&format!(
             "## {}\n- project: {}\n- kind: {}\n- tags: {}\n- created: {}\n\n{}\n\n",
             m.id,
             m.project,
             m.kind,
-            m.tags.join(", "),
+            tags_json,
             m.created_at.to_rfc3339(),
             m.content.trim()
         ));
@@ -24,26 +38,31 @@ pub fn to_markdown(memories: &[Memory]) -> String {
 /// Identifiers and timestamps in the file are informational; import always
 /// creates fresh rows so that importing into a populated database cannot
 /// collide with existing identifiers.
+///
+/// A new section starts only at a line matching `## <uuid>` (see
+/// `is_section_heading`); everything else, including a content line that
+/// happens to start with `## `, is treated as part of the current memory's
+/// body. This keeps the round trip lossless for arbitrary content without
+/// requiring any escaping on write.
 pub fn from_markdown(text: &str) -> Result<Vec<NewMemory>> {
     let mut memories = Vec::new();
 
-    // Prepend a sentinel newline so a `## ` heading at the very start of
-    // `text` (as in a hand-written fixture with no preamble) is matched by
-    // the `"\n## "` delimiter the same way a heading preceded by the
-    // `# mem8 export\n\n` preamble (as in real `to_markdown` output) is.
-    // Without this, `text.split("\n## ")` returns the whole input as a
-    // single unsplit chunk when it starts with `## `, and `.skip(1)` then
-    // discards it entirely instead of yielding it as a section.
-    let sentinel = format!("\n{text}");
+    // Split the input into chunks starting at each section-heading line.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut section_starts: Vec<usize> =
+        lines.iter().enumerate().filter(|(_, l)| is_section_heading(l)).map(|(i, _)| i).collect();
+    section_starts.push(lines.len());
 
-    for section in sentinel.split("\n## ").skip(1) {
+    for window in section_starts.windows(2) {
+        let (start, end) = (window[0], window[1]);
         let mut project = String::new();
         let mut kind: Option<Kind> = None;
         let mut tags: Vec<String> = Vec::new();
         let mut body_lines: Vec<&str> = Vec::new();
         let mut in_body = false;
 
-        for line in section.lines().skip(1) {
+        // Skip the heading line itself (start).
+        for &line in &lines[start + 1..end] {
             if in_body {
                 body_lines.push(line);
             } else if let Some(v) = line.strip_prefix("- project:") {
@@ -51,11 +70,21 @@ pub fn from_markdown(text: &str) -> Result<Vec<NewMemory>> {
             } else if let Some(v) = line.strip_prefix("- kind:") {
                 kind = Some(Kind::from_str(v.trim())?);
             } else if let Some(v) = line.strip_prefix("- tags:") {
-                tags = v
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect();
+                let v = v.trim();
+                tags = if v.is_empty() {
+                    Vec::new()
+                } else if let Ok(parsed) = serde_json::from_str::<Vec<String>>(v) {
+                    parsed
+                } else {
+                    // Fall back to the legacy comma-separated form for
+                    // hand-written or pre-existing files that predate the
+                    // JSON tag format. Tags containing commas cannot be
+                    // recovered unambiguously in this form.
+                    v.split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                };
             } else if line.starts_with("- created:") {
                 continue;
             } else if line.trim().is_empty() && !body_lines.is_empty() {
@@ -138,7 +167,43 @@ mod tests {
 
     #[test]
     fn unknown_kind_in_a_file_is_an_error() {
-        let text = "## 7a1f\n- project: p\n- kind: banana\n- tags:\n- created: 2026-08-11T00:00:00+00:00\n\nBody.\n";
+        let text = "## 7a1f7a1f-7a1f-7a1f-7a1f-7a1f7a1f7a1f\n- project: p\n- kind: banana\n- tags:\n- created: 2026-08-11T00:00:00+00:00\n\nBody.\n";
         assert!(from_markdown(text).is_err());
+    }
+
+    #[test]
+    fn content_with_markdown_heading_survives_roundtrip() {
+        let content = "Intro line.\n## Not actually a heading\nMore body after it.";
+        let original = vec![memory(content, vec![])];
+
+        let text = to_markdown(&original);
+        let parsed = from_markdown(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].content, content);
+    }
+
+    #[test]
+    fn tags_containing_commas_survive_roundtrip() {
+        let original = vec![memory("Some content.", vec!["a,b".to_string(), "c".to_string()])];
+
+        let text = to_markdown(&original);
+        let parsed = from_markdown(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].tags, vec!["a,b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn content_with_front_matter_lookalike_survives_roundtrip() {
+        let content = "Body start.\n- project: not-really\nBody end.";
+        let original = vec![memory(content, vec![])];
+
+        let text = to_markdown(&original);
+        let parsed = from_markdown(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].content, content);
+        assert_eq!(parsed[0].project, "mem8");
     }
 }
