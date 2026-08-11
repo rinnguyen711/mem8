@@ -1,0 +1,336 @@
+use super::Store;
+use crate::error::{Mem8Error, Result};
+use crate::model::{Kind, Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::Mutex;
+use uuid::Uuid;
+
+pub const SCHEMA_VERSION: i32 = 1;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS memories (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    tags        TEXT NOT NULL DEFAULT '[]',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    embedding   BLOB
+);
+CREATE INDEX IF NOT EXISTS idx_project ON memories(project);
+CREATE INDEX IF NOT EXISTS idx_project_kind ON memories(project, kind);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    content,
+    content='memories',
+    content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+"#;
+
+pub struct SqliteStore {
+    conn: Mutex<Connection>,
+}
+
+fn store_err<E: std::fmt::Display>(e: E) -> Mem8Error {
+    Mem8Error::Store(e.to_string())
+}
+
+impl SqliteStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(store_err)?;
+        }
+        let conn = Connection::open(path).map_err(store_err)?;
+        Self::init(conn)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().map_err(store_err)?;
+        Self::init(conn)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
+        conn.execute_batch(SCHEMA).map_err(store_err)?;
+
+        let found: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(store_err)?;
+
+        if found > SCHEMA_VERSION {
+            return Err(Mem8Error::Migration { found, expected: SCHEMA_VERSION });
+        }
+        if found < SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(store_err)?;
+        }
+
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+}
+
+fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
+    let id: String = row.get("id")?;
+    let kind: String = row.get("kind")?;
+    let tags: String = row.get("tags")?;
+    let created: String = row.get("created_at")?;
+    let updated: String = row.get("updated_at")?;
+
+    Ok(Memory {
+        id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+        project: row.get("project")?,
+        kind: Kind::from_str(&kind).unwrap_or(Kind::Fact),
+        content: row.get("content")?,
+        tags: serde_json::from_str(&tags).unwrap_or_default(),
+        created_at: DateTime::parse_from_rfc3339(&created)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        updated_at: DateTime::parse_from_rfc3339(&updated)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        embedding: None,
+    })
+}
+
+#[async_trait]
+impl Store for SqliteStore {
+    async fn add(&self, new: NewMemory) -> Result<Memory> {
+        let now = Utc::now();
+        let memory = Memory {
+            id: Uuid::new_v4(),
+            project: new.project,
+            kind: new.kind,
+            content: new.content,
+            tags: new.tags,
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+        };
+
+        let tags = serde_json::to_string(&memory.tags).map_err(store_err)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memories (id, project, kind, content, tags, created_at, updated_at, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                params![
+                    memory.id.to_string(),
+                    memory.project,
+                    memory.kind.to_string(),
+                    memory.content,
+                    tags,
+                    memory.created_at.to_rfc3339(),
+                    memory.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(store_err)?;
+
+        Ok(memory)
+    }
+
+    async fn get(&self, id: Uuid) -> Result<Memory> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM memories WHERE id = ?1",
+            params![id.to_string()],
+            row_to_memory,
+        )
+        .optional()
+        .map_err(store_err)?
+        .ok_or_else(|| Mem8Error::NotFound(id.to_string()))
+    }
+
+    async fn update(&self, id: Uuid, update: MemoryUpdate) -> Result<Memory> {
+        let current = self.get(id).await?;
+        let content = update.content.unwrap_or(current.content);
+        let kind = update.kind.unwrap_or(current.kind);
+        let tags = update.tags.unwrap_or(current.tags);
+        let updated_at = Utc::now();
+        let tags_json = serde_json::to_string(&tags).map_err(store_err)?;
+
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET content = ?1, kind = ?2, tags = ?3, updated_at = ?4
+                 WHERE id = ?5",
+                params![
+                    content,
+                    kind.to_string(),
+                    tags_json,
+                    updated_at.to_rfc3339(),
+                    id.to_string()
+                ],
+            )
+            .map_err(store_err)?;
+
+        Ok(Memory { content, kind, tags, updated_at, ..current })
+    }
+
+    async fn delete(&self, id: Uuid) -> Result<()> {
+        let changed = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM memories WHERE id = ?1", params![id.to_string()])
+            .map_err(store_err)?;
+
+        if changed == 0 {
+            return Err(Mem8Error::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    async fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>> {
+        let mut sql = String::from(
+            "SELECT m.*, bm25(memories_fts) AS score
+             FROM memories_fts
+             JOIN memories m ON m.rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.text.clone())];
+
+        if !query.global {
+            if let Some(project) = &query.project {
+                binds.push(Box::new(project.clone()));
+                sql.push_str(&format!(" AND m.project = ?{}", binds.len()));
+            }
+        }
+        if let Some(kind) = query.kind {
+            binds.push(Box::new(kind.to_string()));
+            sql.push_str(&format!(" AND m.kind = ?{}", binds.len()));
+        }
+
+        sql.push_str(" ORDER BY score LIMIT ?");
+        binds.push(Box::new(query.limit as i64));
+        sql.push_str(&binds.len().to_string());
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let params: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                let score: f64 = row.get("score")?;
+                Ok(SearchHit { memory: row_to_memory(row)?, score: -score })
+            })
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(store_err)?;
+
+        // Tag filtering happens here rather than in SQL: tags are stored as a
+        // JSON string in SQLite, so an AND-across-tags predicate is clearer in
+        // Rust than in nested json_each subqueries.
+        Ok(rows
+            .into_iter()
+            .filter(|hit| query.tags.iter().all(|t| hit.memory.tags.contains(t)))
+            .collect())
+    }
+
+    async fn all(&self) -> Result<Vec<Memory>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM memories ORDER BY created_at ASC")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], row_to_memory)
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(store_err)?;
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Kind, NewMemory, SearchQuery};
+
+    fn store() -> SqliteStore {
+        SqliteStore::open_in_memory().unwrap()
+    }
+
+    fn new_memory(project: &str, content: &str) -> NewMemory {
+        NewMemory {
+            project: project.into(),
+            kind: Kind::Decision,
+            content: content.into(),
+            tags: vec!["rust".into()],
+        }
+    }
+
+    fn query(text: &str, project: &str) -> SearchQuery {
+        SearchQuery {
+            text: text.into(),
+            project: Some(project.into()),
+            global: false,
+            kind: None,
+            tags: vec![],
+            limit: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_then_get_roundtrips_all_fields() {
+        let s = store();
+        let added = s.add(new_memory("p1", "we chose rust for the binary")).await.unwrap();
+        let got = s.get(added.id).await.unwrap();
+        assert_eq!(got.content, "we chose rust for the binary");
+        assert_eq!(got.kind, Kind::Decision);
+        assert_eq!(got.tags, vec!["rust".to_string()]);
+        assert_eq!(got.project, "p1");
+        assert!(got.embedding.is_none());
+    }
+
+    #[tokio::test]
+    async fn fts_finds_memory_by_word() {
+        let s = store();
+        s.add(new_memory("p1", "we chose rust for the binary")).await.unwrap();
+        let hits = s.search(query("rust", "p1")).await.unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fts_index_updates_after_content_change() {
+        let s = store();
+        let added = s.add(new_memory("p1", "we chose rust")).await.unwrap();
+        s.update(
+            added.id,
+            crate::model::MemoryUpdate {
+                content: Some("we chose python".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(s.search(query("rust", "p1")).await.unwrap().is_empty());
+        assert_eq!(s.search(query("python", "p1")).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fts_index_drops_deleted_rows() {
+        let s = store();
+        let added = s.add(new_memory("p1", "we chose rust")).await.unwrap();
+        s.delete(added.id).await.unwrap();
+        assert!(s.search(query("rust", "p1")).await.unwrap().is_empty());
+    }
+}

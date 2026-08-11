@@ -1,3 +1,5 @@
+pub mod sqlite;
+
 use crate::error::{Mem8Error, Result};
 use crate::model::{Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery};
 use async_trait::async_trait;
