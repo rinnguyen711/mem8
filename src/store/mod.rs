@@ -24,6 +24,12 @@ pub trait Store: Send + Sync {
 /// In-memory `Store` used by `core` unit tests. Substring matching stands in
 /// for full-text search; ranking fidelity is covered by the contract suite
 /// against the real backends.
+///
+/// Test support only — do not wire this in as a production backend. Its
+/// `Mutex` guards are unwrapped without poisoning recovery, so a panic taken
+/// while the lock is held would poison it and fail every later call on the
+/// same instance. The real backends carry the availability requirement that
+/// a store failure must not end the session.
 pub struct MemStore {
     rows: Mutex<Vec<Memory>>,
 }
