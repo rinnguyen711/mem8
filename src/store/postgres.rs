@@ -45,6 +45,7 @@ impl PgStore {
     }
 
     /// Truncate all memories. Test-support only.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn reset_for_tests(&self) -> Result<()> {
         sqlx::query("TRUNCATE memories")
             .execute(&self.pool)

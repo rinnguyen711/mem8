@@ -951,6 +951,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "mem8",
  "rmcp",
  "rusqlite",
  "schemars 0.8.22",

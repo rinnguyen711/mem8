@@ -28,3 +28,7 @@ dirs = "5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+mem8 = { path = ".", features = ["test-support"] }
+
+[features]
+test-support = []
