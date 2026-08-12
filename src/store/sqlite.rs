@@ -28,7 +28,8 @@ CREATE INDEX IF NOT EXISTS idx_project_kind ON memories(project, kind);
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
     content='memories',
-    content_rowid='rowid'
+    content_rowid='rowid',
+    tokenize='porter'
 );
 
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN

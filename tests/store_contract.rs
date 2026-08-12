@@ -1,3 +1,4 @@
+use mem8::core::sanitize_fts_query;
 use mem8::model::{Kind, MemoryUpdate, NewMemory, SearchQuery};
 use mem8::store::sqlite::SqliteStore;
 use mem8::store::Store;
@@ -105,6 +106,41 @@ pub async fn run_contract(store: &dyn Store) {
     // `all` returns every remaining memory in creation order.
     let all = store.all().await.unwrap();
     assert!(all.windows(2).all(|w| w[0].created_at <= w[1].created_at));
+
+    // Hyphenated identifiers are findable as a unit, on both backends. The
+    // `Store` trait receives text already sanitized by
+    // `core::sanitize_fts_query` (that is `Memory8::search`'s job, not the
+    // store's) -- passing a raw hyphenated string straight to FTS5 MATCH
+    // errors with "no such column", so this test goes through the real
+    // sanitizer, exactly as production code does. Naive punctuation-stripping
+    // would have split "auth-token" into two bare terms, letting a query
+    // match unrelated documents containing "auth" and "token" far apart;
+    // quoting the term as a literal phrase avoids that.
+    let hyphen_id = store
+        .add(new_memory("p3", Kind::Fact, "we use auth-token for login", &[]))
+        .await
+        .unwrap();
+    let hyphen_text = sanitize_fts_query("auth-token").unwrap();
+    let hyphen_query = SearchQuery { project: Some("p3".into()), ..query(&hyphen_text) };
+    let hyphen_hits = store.search(hyphen_query).await.unwrap();
+    assert_eq!(hyphen_hits.len(), 1);
+    assert_eq!(hyphen_hits[0].memory.id, hyphen_id.id);
+
+    // Stemming: SQLite's FTS5 table now uses the porter tokenizer, matching
+    // Postgres's `to_tsvector('english', ...)`, so the two backends must
+    // agree on stem variants. "running" is unambiguous in project "p4" (no
+    // other memory there contains any form of "run"), so a search for the
+    // stem "run" finding exactly it proves the backends now agree rather
+    // than the query happening to match on a bare substring.
+    let stem_id = store
+        .add(new_memory("p4", Kind::Fact, "the team is running tests", &[]))
+        .await
+        .unwrap();
+    let stem_text = sanitize_fts_query("run").unwrap();
+    let stem_query = SearchQuery { project: Some("p4".into()), ..query(&stem_text) };
+    let stem_hits = store.search(stem_query).await.unwrap();
+    assert_eq!(stem_hits.len(), 1);
+    assert_eq!(stem_hits[0].memory.id, stem_id.id);
 }
 
 #[tokio::test]
