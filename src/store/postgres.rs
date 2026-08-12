@@ -83,34 +83,32 @@ fn row_to_memory(row: &PgRow) -> Result<Memory> {
 #[async_trait]
 impl Store for PgStore {
     async fn add(&self, new: NewMemory) -> Result<Memory> {
+        // INSERT ... RETURNING * (mirroring update()'s pattern) so the
+        // returned Memory is built from what Postgres actually stored,
+        // rather than from the Rust-side value before insertion. The
+        // in-memory `now` carries nanosecond precision but the TIMESTAMPTZ
+        // column only holds microseconds; reading the row back is what
+        // makes add()'s return value match what a later get() produces.
         let now = Utc::now();
-        let memory = Memory {
-            id: Uuid::new_v4(),
-            project: new.project,
-            kind: new.kind,
-            content: new.content,
-            tags: new.tags,
-            created_at: now,
-            updated_at: now,
-            embedding: None,
-        };
+        let id = Uuid::new_v4();
 
-        sqlx::query(
+        let row = sqlx::query(
             "INSERT INTO memories (id, project, kind, content, tags, created_at, updated_at, embedding)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+             RETURNING *",
         )
-        .bind(memory.id)
-        .bind(&memory.project)
-        .bind(memory.kind.to_string())
-        .bind(&memory.content)
-        .bind(&memory.tags)
-        .bind(memory.created_at)
-        .bind(memory.updated_at)
-        .execute(&self.pool)
+        .bind(id)
+        .bind(&new.project)
+        .bind(new.kind.to_string())
+        .bind(&new.content)
+        .bind(&new.tags)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&self.pool)
         .await
         .map_err(store_err)?;
 
-        Ok(memory)
+        row_to_memory(&row)
     }
 
     async fn get(&self, id: Uuid) -> Result<Memory> {
