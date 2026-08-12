@@ -8,20 +8,31 @@ use uuid::Uuid;
 pub const DEFAULT_LIMIT: usize = 10;
 pub const MAX_LIMIT: usize = 50;
 
-/// Strip FTS operator syntax from a raw agent query.
+/// Sanitize a raw agent query into a safe FTS query string.
 ///
 /// FTS5 and `plainto_tsquery` both parse their input, and unbalanced quotes or
-/// stray operators are errors rather than literal text. Agents write these by
-/// accident, so reduce the query to bare terms before it reaches the store.
+/// stray operators are errors rather than literal text. Splitting on FTS
+/// syntax characters (as a naive sanitizer would) also breaks hyphenated
+/// identifiers like `auth-token` into two independent terms, which can then
+/// match a document containing "auth" and "token" nowhere near each other.
+///
+/// Instead, each surviving term is wrapped as a double-quoted FTS5 phrase, so
+/// `auth-token login` becomes `"auth-token" "login"`. FTS5 treats a quoted
+/// phrase as literal text, hyphen included, so this both avoids the parse
+/// error a raw hyphen triggers and searches for the identifier as a unit.
+/// Postgres's `plainto_tsquery` receives the same string; it ignores
+/// punctuation and operators entirely, so the quotes are inert there.
+///
+/// A double quote embedded in a term is escaped by doubling it (`""`), which
+/// is how FTS5 string literals escape an embedded quote, so no user input can
+/// produce a malformed query.
 pub fn sanitize_fts_query(raw: &str) -> Result<String> {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| if "\"'()*:^-".contains(c) { ' ' } else { c })
-        .collect();
-
-    let terms: Vec<&str> = cleaned
+    let terms: Vec<String> = raw
         .split_whitespace()
         .filter(|t| !matches!(*t, "AND" | "OR" | "NOT" | "NEAR"))
+        .map(|t| t.trim_matches(|c| "\"'()*:^".contains(c)))
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect();
 
     if terms.is_empty() {
@@ -202,13 +213,22 @@ mod tests {
 
     #[test]
     fn sanitize_strips_unbalanced_quotes() {
+        // An unbalanced quote in the raw query must not carry through into an
+        // unbalanced quote in the emitted FTS string -- that would make the
+        // query malformed. The term's own stray `"` is trimmed, then the term
+        // is re-wrapped in a fresh, properly balanced pair of quotes.
         let cleaned = sanitize_fts_query("auth \"broken").unwrap();
-        assert!(!cleaned.contains('"'));
+        assert_eq!(cleaned, "\"auth\" \"broken\"");
+        assert_eq!(cleaned.matches('"').count() % 2, 0, "quotes must balance");
     }
 
     #[test]
     fn sanitize_strips_fts_operators() {
+        // Bare FTS operator keywords are dropped; stray operator punctuation
+        // clinging to a term is trimmed before the term is quoted, so no
+        // operator syntax survives into the emitted query.
         let cleaned = sanitize_fts_query("auth AND (login OR session)*").unwrap();
+        assert_eq!(cleaned, "\"auth\" \"login\" \"session\"");
         assert!(!cleaned.contains('('));
         assert!(!cleaned.contains(')'));
         assert!(!cleaned.contains('*'));
@@ -217,6 +237,26 @@ mod tests {
     #[test]
     fn sanitize_rejects_a_query_with_no_usable_terms() {
         assert!(sanitize_fts_query("\"\"()*").is_err());
+    }
+
+    #[test]
+    fn hyphenated_term_is_quoted_not_split() {
+        // The old sanitizer stripped `-` and produced two bare terms
+        // (`auth token`), which could match a document containing "auth" and
+        // "token" nowhere near each other. It must now survive as one quoted
+        // phrase so FTS5 treats the hyphenated identifier as literal text.
+        let cleaned = sanitize_fts_query("auth-token").unwrap();
+        assert_eq!(cleaned, "\"auth-token\"");
+    }
+
+    #[test]
+    fn embedded_quote_cannot_break_the_query() {
+        // A term containing a literal `"` must not produce a malformed FTS
+        // string. The embedded quote is escaped by doubling it, so the
+        // overall query stays a well-formed, balanced sequence of phrases.
+        let cleaned = sanitize_fts_query("say\"hi").unwrap();
+        assert_eq!(cleaned, "\"say\"\"hi\"");
+        assert_eq!(cleaned.matches('"').count() % 2, 0, "quotes must balance");
     }
 
     #[tokio::test]

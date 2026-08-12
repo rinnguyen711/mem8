@@ -109,14 +109,28 @@ impl Store for MemStore {
     }
 
     async fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>> {
-        let needle = query.text.to_lowercase();
+        // `query.text` arrives pre-sanitized by `core::sanitize_fts_query` as
+        // space-separated double-quoted phrases (e.g. `"auth-token" "login"`).
+        // A real FTS engine ANDs separate terms together, so this stand-in
+        // strips the quoting and requires every term to appear as a substring,
+        // rather than treating the whole sanitized string as one literal
+        // needle (which would never match once terms carry quotes).
+        let needles: Vec<String> = query
+            .text
+            .split(' ')
+            .map(|t| t.trim_matches('"').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
         let rows = self.rows.lock().unwrap();
         let hits = rows
             .iter()
             .filter(|m| query.global || query.project.as_deref() == Some(m.project.as_str()))
             .filter(|m| query.kind.is_none_or(|k| k == m.kind))
             .filter(|m| query.tags.iter().all(|t| m.tags.contains(t)))
-            .filter(|m| m.content.to_lowercase().contains(&needle))
+            .filter(|m| {
+                let content = m.content.to_lowercase();
+                needles.iter().all(|n| content.contains(n.as_str()))
+            })
             .take(query.limit)
             .map(|m| SearchHit { memory: m.clone(), score: 1.0 })
             .collect();
