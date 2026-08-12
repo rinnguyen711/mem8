@@ -1,0 +1,13 @@
+{
+  "name": "mem8",
+  "owner": {
+    "name": "Rin Nguyen"
+  },
+  "plugins": [
+    {
+      "name": "mem8",
+      "source": "./plugin",
+      "description": "Persistent, project-scoped memory for AI coding agents, backed by SQLite or Postgres."
+    }
+  ]
+}

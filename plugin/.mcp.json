@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mem8": {
+      "command": "mem8",
+      "args": ["serve"]
+    }
+  }
+}

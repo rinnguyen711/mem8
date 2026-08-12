@@ -1,0 +1,31 @@
+{
+  "name": "mem8",
+  "version": "0.1.0",
+  "description": "Persistent memory for AI coding agents, scoped to the project you are working in. Keyword search over SQLite or Postgres, with no API key and no network calls.",
+  "author": {
+    "name": "Rin Nguyen"
+  },
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "persistence",
+    "mcp",
+    "sqlite",
+    "postgres"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "timeout": 10,
+            "statusMessage": "Loading mem8 memory..."
+          }
+        ]
+      }
+    ]
+  }
+}

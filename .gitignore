@@ -3,3 +3,6 @@
 *.db-shm
 *.db-wal
 .superpowers/
+
+# Scratch from the subagent-driven development workflow
+/.superpowers/
