@@ -22,7 +22,10 @@ pub struct AddMemoryParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchMemoryParams {
-    /// Keywords to search for.
+    /// Distinctive keywords, not a sentence. Every word must appear in a
+    /// memory for it to match, so "porter tokenizer" finds more than "why did
+    /// we pick the porter tokenizer". Two or three specific terms work best;
+    /// search again with different words if the first attempt finds nothing.
     pub query: String,
     /// Restrict results to one kind.
     pub kind: Option<Kind>,
@@ -129,7 +132,7 @@ impl Mem8Server {
     }
 
     #[tool(
-        description = "Search stored memories by keyword. Scoped to the current project unless global is true."
+        description = "Search stored memories by keyword. Search here before concluding something is unknown or was never decided — memories from earlier sessions are not otherwise visible. Scoped to the current project unless global is true."
     )]
     async fn search_memory(
         &self,

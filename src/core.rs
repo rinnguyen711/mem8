@@ -26,12 +26,33 @@ pub const MAX_LIMIT: usize = 50;
 /// A double quote embedded in a term is escaped by doubling it (`""`), which
 /// is how FTS5 string literals escape an embedded quote, so no user input can
 /// produce a malformed query.
+///
+/// Common English function words are dropped as well. Both engines require
+/// every term to match, so a question phrased naturally — "why do the backends
+/// stem the same?" — otherwise finds nothing, because the stored memory is
+/// unlikely to contain "why" and "do" and "the". Stripping them leaves the
+/// words that carry the meaning. They are only stripped when something else
+/// survives, so a search for a phrase made entirely of them still runs.
 pub fn sanitize_fts_query(raw: &str) -> Result<String> {
-    let terms: Vec<String> = raw
+    let cleaned: Vec<&str> = raw
         .split_whitespace()
         .filter(|t| !matches!(*t, "AND" | "OR" | "NOT" | "NEAR"))
-        .map(|t| t.trim_matches(|c| "\"'()*:^".contains(c)))
+        .map(|t| t.trim_matches(|c| "\"'()*:^?!,.;".contains(c)))
         .filter(|t| !t.is_empty())
+        .collect();
+
+    let meaningful: Vec<&str> = cleaned
+        .iter()
+        .copied()
+        .filter(|t| !is_stopword(t))
+        .collect();
+
+    // Fall back to the full set when a query is nothing but function words, so
+    // it still searches rather than erroring.
+    let kept = if meaningful.is_empty() { &cleaned } else { &meaningful };
+
+    let terms: Vec<String> = kept
+        .iter()
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect();
 
@@ -42,6 +63,23 @@ pub fn sanitize_fts_query(raw: &str) -> Result<String> {
     }
 
     Ok(terms.join(" "))
+}
+
+/// English function words that carry no search signal.
+///
+/// Deliberately short: it covers the words that turn a natural question into a
+/// query matching nothing, and stops well short of a full stopword list, since
+/// every word removed here is one a user can no longer search for in a phrase.
+fn is_stopword(term: &str) -> bool {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does", "for",
+        "from", "had", "has", "have", "how", "i", "in", "is", "it", "of", "on", "or", "our", "so",
+        "than", "that", "the", "their", "them", "then", "there", "these", "they", "this", "to",
+        "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with",
+        "would", "you", "your",
+    ];
+    let lower = term.to_lowercase();
+    STOPWORDS.contains(&lower.as_str())
 }
 
 /// The memory service. Owns validation and scope resolution so that the MCP
@@ -232,6 +270,30 @@ mod tests {
         assert!(!cleaned.contains('('));
         assert!(!cleaned.contains(')'));
         assert!(!cleaned.contains('*'));
+    }
+
+    #[test]
+    fn sanitize_drops_function_words_from_a_question() {
+        // The exact query that found nothing in real use, against a memory
+        // reading "both backends stem identically".
+        let cleaned = sanitize_fts_query("why do backends stem the same").unwrap();
+        assert!(!cleaned.contains("why"), "got: {cleaned}");
+        assert!(!cleaned.contains("\"do\""), "got: {cleaned}");
+        assert!(!cleaned.contains("\"the\""), "got: {cleaned}");
+        assert!(cleaned.contains("backends") && cleaned.contains("stem"), "got: {cleaned}");
+    }
+
+    #[test]
+    fn sanitize_keeps_function_words_when_they_are_all_there_is() {
+        // Stripping every term would turn a legitimate search into an error.
+        let cleaned = sanitize_fts_query("the who").unwrap();
+        assert!(cleaned.contains("the") && cleaned.contains("who"), "got: {cleaned}");
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_question_marks() {
+        let cleaned = sanitize_fts_query("tokenizer?").unwrap();
+        assert_eq!(cleaned, "\"tokenizer\"");
     }
 
     #[test]
