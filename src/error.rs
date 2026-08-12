@@ -11,6 +11,12 @@ pub enum Mem8Error {
     #[error("store error: {0}")]
     Store(String),
 
+    #[error("{path}: {source}")]
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
+
     #[error("could not determine project scope: {0}")]
     Scope(String),
 
