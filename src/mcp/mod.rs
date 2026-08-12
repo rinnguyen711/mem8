@@ -5,7 +5,6 @@ use crate::model::{Kind, SearchHit};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
-use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -13,8 +12,8 @@ use uuid::Uuid;
 pub struct AddMemoryParams {
     /// The memory to store, in full sentences.
     pub content: String,
-    /// One of: decision, preference, convention, fact, learning.
-    pub kind: String,
+    /// The kind of memory: decision, preference, convention, fact, or learning.
+    pub kind: Kind,
     /// Optional labels for filtering later.
     pub tags: Option<Vec<String>>,
     /// Overrides the auto-detected project scope.
@@ -26,7 +25,7 @@ pub struct SearchMemoryParams {
     /// Keywords to search for.
     pub query: String,
     /// Restrict results to one kind.
-    pub kind: Option<String>,
+    pub kind: Option<Kind>,
     /// Only return memories carrying all of these tags.
     pub tags: Option<Vec<String>>,
     /// Overrides the auto-detected project scope.
@@ -50,7 +49,7 @@ pub struct UpdateMemoryParams {
     /// Replacement content.
     pub content: Option<String>,
     /// Replacement kind.
-    pub kind: Option<String>,
+    pub kind: Option<Kind>,
     /// Replacement tags; replaces the whole list.
     pub tags: Option<Vec<String>>,
 }
@@ -76,10 +75,6 @@ fn result_text(result: &CallToolResult) -> String {
 
 fn parse_id(raw: &str) -> Result<Uuid, CallToolResult> {
     Uuid::parse_str(raw).map_err(|_| fail(format!("'{raw}' is not a valid memory id")))
-}
-
-fn parse_kind(raw: &str) -> Result<Kind, CallToolResult> {
-    Kind::from_str(raw).map_err(|e| fail(e.to_string()))
 }
 
 fn render_hits(hits: &[SearchHit]) -> String {
@@ -123,14 +118,9 @@ impl Mem8Server {
         &self,
         Parameters(p): Parameters<AddMemoryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let kind = match parse_kind(&p.kind) {
-            Ok(k) => k,
-            Err(e) => return Ok(e),
-        };
-
         Ok(match self
             .service
-            .add(&p.content, kind, p.tags.unwrap_or_default(), p.project)
+            .add(&p.content, p.kind, p.tags.unwrap_or_default(), p.project)
             .await
         {
             Ok(m) => ok(format!("Stored {} memory in '{}'. id: {}", m.kind, m.project, m.id)),
@@ -145,18 +135,13 @@ impl Mem8Server {
         &self,
         Parameters(p): Parameters<SearchMemoryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let kind = match p.kind.as_deref().map(parse_kind).transpose() {
-            Ok(k) => k,
-            Err(e) => return Ok(e),
-        };
-
         Ok(match self
             .service
             .search(
                 &p.query,
                 p.project,
                 p.global.unwrap_or(false),
-                kind,
+                p.kind,
                 p.tags.unwrap_or_default(),
                 p.limit,
             )
@@ -203,12 +188,7 @@ impl Mem8Server {
             Ok(i) => i,
             Err(e) => return Ok(e),
         };
-        let kind = match p.kind.as_deref().map(parse_kind).transpose() {
-            Ok(k) => k,
-            Err(e) => return Ok(e),
-        };
-
-        Ok(match self.service.update(id, p.content, kind, p.tags).await {
+        Ok(match self.service.update(id, p.content, p.kind, p.tags).await {
             Ok(m) => ok(format!("Updated memory {}.", m.id)),
             Err(e) => fail(e.to_string()),
         })
@@ -262,7 +242,7 @@ mod tests {
         let s = server();
         s.add_memory(Parameters(AddMemoryParams {
             content: "we chose rust".into(),
-            kind: "decision".into(),
+            kind: Kind::Decision,
             tags: None,
             project: Some("p1".into()),
         }))
@@ -285,21 +265,30 @@ mod tests {
         assert!(text.contains("we chose rust"), "got: {text}");
     }
 
-    #[tokio::test]
-    async fn unknown_kind_is_a_tool_error_not_a_panic() {
-        let s = server();
-        let result = s
-            .add_memory(Parameters(AddMemoryParams {
-                content: "something".into(),
-                kind: "banana".into(),
-                tags: None,
-                project: Some("p1".into()),
-            }))
-            .await
-            .expect("protocol-level call must not fail");
+    /// `kind` is now the real `Kind` enum, so an unrecognized value can no
+    /// longer be expressed by constructing `AddMemoryParams` directly -- it
+    /// won't compile. The failure now happens one layer down, in JSON
+    /// deserialization (the same `serde_json::from_value` path rmcp's own
+    /// `Parameters` extractor uses; see `tests/e2e.rs` for confirmation of
+    /// the exact wire-level response a real client receives). What matters
+    /// here is that deserializing a bad kind fails cleanly -- with a message
+    /// naming the bad value and the valid ones -- rather than panicking.
+    #[test]
+    fn unknown_kind_fails_deserialization_not_a_panic() {
+        let raw = serde_json::json!({
+            "content": "something",
+            "kind": "banana",
+            "project": "p1"
+        });
 
-        assert!(result.is_error.unwrap_or(false), "expected a tool error");
-        assert!(result_text(&result).contains("banana"));
+        let err = serde_json::from_value::<AddMemoryParams>(raw)
+            .expect_err("an unrecognized kind must not deserialize");
+
+        let message = err.to_string();
+        assert!(message.contains("banana"), "got: {message}");
+        for k in ["decision", "preference", "convention", "fact", "learning"] {
+            assert!(message.contains(k), "expected '{k}' documented in error, got: {message}");
+        }
     }
 
     #[tokio::test]

@@ -127,30 +127,57 @@ fn handshake_then_add_then_search_over_real_stdio() {
         assert!(names.contains(&expected.to_string()), "missing tool {expected} in {names:?}");
     }
 
-    // schemars 0.8 -> 1 bump (Task 10): confirm the derived schema for
-    // `AddMemoryParams::kind` (a plain `String` field, documented via doc
-    // comment only -- there is no `#[schemars(...)]` enum attribute in
-    // src/mcp/mod.rs) still round-trips as a plain string schema. This is
-    // not itself a `Kind` enum schema; see the assertion below and the
-    // report for the full finding.
+    // `AddMemoryParams::kind` is now the real `Kind` enum, so schemars must
+    // derive a closed schema listing the five lowercase variants -- a real
+    // MCP client can introspect and validate against this without reading
+    // prose. Print the raw schema so `cargo test -- --nocapture` shows
+    // exactly what schemars 1.x emits for a fieldless enum with
+    // `#[serde(rename_all = "lowercase")]`.
     let add_memory_tool =
         tools.iter().find(|t| t["name"] == "add_memory").expect("add_memory tool must be listed");
     let input_schema = &add_memory_tool["inputSchema"];
     let kind_schema = &input_schema["properties"]["kind"];
+    println!("add_memory inputSchema:\n{}", serde_json::to_string_pretty(input_schema).unwrap());
+    println!("kind schema:\n{}", serde_json::to_string_pretty(kind_schema).unwrap());
+
+    // schemars 1.x hoists the fieldless enum into `$defs` and leaves a
+    // `$ref` on the field itself, so resolve the ref to reach the `enum`
+    // array.
+    let kind_ref = kind_schema["$ref"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kind schema has no '$ref': {kind_schema}"));
+    let def_name = kind_ref.rsplit('/').next().unwrap();
+    let kind_def = &input_schema["$defs"][def_name];
+    let enum_values: Vec<String> = kind_def["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Kind $def has no 'enum' array: {kind_def}"))
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    let expected = ["decision", "preference", "convention", "fact", "learning"];
     assert_eq!(
-        kind_schema["type"], "string",
-        "add_memory's kind parameter schema changed shape: {kind_schema}"
+        enum_values, expected,
+        "add_memory's kind enum no longer lists exactly the five expected values, in order: {kind_schema}"
     );
-    // The five valid values are documented only in the description text
-    // (schemars does not derive a closed enum from a bare String field), so
-    // pin that contract too: if the doc comment drifts from the real Kind
-    // enum, this catches it.
-    let description = kind_schema["description"].as_str().unwrap_or_default();
-    for k in ["decision", "preference", "convention", "fact", "learning"] {
-        assert!(
-            description.contains(k),
-            "kind parameter description no longer documents '{k}': {description}"
-        );
+
+    // An invalid kind now fails during rmcp's own JSON deserialization,
+    // before the tool handler runs -- that's a protocol-level error
+    // (JSON-RPC `error`, not a successful `result` carrying a tool error).
+    // Confirm the message a real client receives is still intelligible and
+    // still names the valid values.
+    let bad_kind = server.request(
+        "tools/call",
+        serde_json::json!({
+            "name": "add_memory",
+            "arguments": { "content": "x", "kind": "banana", "project": "p1" }
+        }),
+    );
+    println!("invalid kind response:\n{}", serde_json::to_string_pretty(&bad_kind).unwrap());
+    assert!(bad_kind.get("error").is_some(), "expected a protocol-level error: {bad_kind}");
+    let message = bad_kind["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("banana"), "error message should name the bad value: {message}");
+    for k in expected {
+        assert!(message.contains(k), "error message should still document '{k}': {message}");
     }
 
     // Store a memory.
