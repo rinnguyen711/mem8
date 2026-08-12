@@ -212,7 +212,36 @@ impl Mem8Server {
 }
 
 #[tool_handler]
-impl ServerHandler for Mem8Server {}
+impl ServerHandler for Mem8Server {
+    /// Advertise the tools capability and identify this server by name.
+    ///
+    /// `#[tool_handler]` wires up `list_tools` and `call_tool` but leaves
+    /// `get_info` at its default, which reports no capabilities at all. A
+    /// client that trusts the handshake — as the specification says it should —
+    /// then never registers the tools, even though `tools/list` would have
+    /// returned all five. The default also names the server after the SDK
+    /// rather than after mem8.
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo {
+            capabilities: rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+            server_info: rmcp::model::Implementation {
+                name: env!("CARGO_PKG_NAME").to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                ..Default::default()
+            },
+            instructions: Some(
+                "Persistent memory that outlives this session, scoped to the \
+                 current project. Search before assuming something is unknown, \
+                 and store decisions, preferences, conventions, facts, and \
+                 learnings worth recalling later."
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+}
 
 /// Run the MCP server over stdio until the client disconnects.
 pub async fn serve_stdio() -> anyhow::Result<()> {

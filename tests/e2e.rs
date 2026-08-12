@@ -109,6 +109,24 @@ fn handshake_then_add_then_search_over_real_stdio() {
         }),
     );
     assert!(init.get("result").is_some(), "initialize failed: {init}");
+
+    // The handshake must advertise the tools capability. A client that trusts
+    // it — as the specification says it should — will not register any tools
+    // without this, even though `tools/list` below would answer correctly.
+    assert!(
+        init["result"]["capabilities"]["tools"].is_object(),
+        "initialize must advertise the tools capability, got: {}",
+        init["result"]["capabilities"]
+    );
+
+    // And identify this server, not the SDK it happens to be built on.
+    assert_eq!(
+        init["result"]["serverInfo"]["name"].as_str(),
+        Some("mem8"),
+        "initialize should name mem8, got: {}",
+        init["result"]["serverInfo"]
+    );
+
     server.notify("notifications/initialized");
 
     // All five tools are advertised.
