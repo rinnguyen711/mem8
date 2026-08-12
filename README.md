@@ -38,8 +38,9 @@ Add to your MCP configuration:
 | `delete_memory` | Remove a memory permanently. |
 
 `kind` is a fixed enum: `decision`, `preference`, `convention`, `fact`, or
-`learning`. Sending anything else fails with an error naming all five valid
-values.
+`learning`. Sending anything else is rejected before the tool runs, as a
+protocol-level error naming all five valid values — not as a normal tool
+result.
 
 Project scope is detected automatically from the git root of the working
 directory (its directory name), falling back to the working directory's own
@@ -54,7 +55,7 @@ on `search_memory` to search across every project.
 - `sqlite://path/to/file.db` — SQLite at that path (relative or absolute; an
   absolute path produces the familiar three-slash form, e.g.
   `sqlite:///home/me/mem8.db`)
-- `postgres://user@host/db` — Postgres
+- `postgres://user@host/db` or `postgresql://user@host/db` — Postgres
 
 Postgres support is compile-verified only: the code builds and the contract
 tests are written against it, but it has not been exercised against a live
@@ -79,9 +80,11 @@ exact shape starts a new section — a content line that happens to begin with
 stays part of the current memory's body, so round-tripping arbitrary content
 is safe.
 
-A section requires a UUID heading, a `- project:` line, a `- kind:` line, and
-a non-empty body; missing any of them fails the import with an error naming
-the offending section. `- created:` is informational only. Tags are written
+Within a section, `- project:`, `- kind:`, and a non-empty body are all
+required; missing any of them fails the import with an error naming the
+offending section. A malformed or missing heading is different: it produces no
+error, because nothing is recognised as a section — that text is simply not
+imported. `- created:` is informational only. Tags are written
 as a JSON array (`- tags: ["a,b","c"]`); a legacy comma-separated form is
 still accepted on import but can't unambiguously represent a tag containing a
 comma.
