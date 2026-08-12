@@ -44,6 +44,12 @@ pub fn to_markdown(memories: &[Memory]) -> String {
 /// happens to start with `## `, is treated as part of the current memory's
 /// body. This keeps the round trip lossless for arbitrary content without
 /// requiring any escaping on write.
+///
+/// A recognised section is rejected with a named error, rather than being
+/// silently dropped or misfiled, if it is missing `kind:`, missing
+/// `project:`, or has no body content. Trailing blank lines after the last
+/// section (or whitespace between sections) are not sections and are not
+/// affected by this.
 pub fn from_markdown(text: &str) -> Result<Vec<NewMemory>> {
     let mut memories = Vec::new();
 
@@ -55,6 +61,7 @@ pub fn from_markdown(text: &str) -> Result<Vec<NewMemory>> {
 
     for window in section_starts.windows(2) {
         let (start, end) = (window[0], window[1]);
+        let heading_id = lines[start].strip_prefix("## ").unwrap_or(lines[start]).trim();
         let mut project = String::new();
         let mut kind: Option<Kind> = None;
         let mut tags: Vec<String> = Vec::new();
@@ -95,20 +102,26 @@ pub fn from_markdown(text: &str) -> Result<Vec<NewMemory>> {
         }
 
         let content = body_lines.join("\n").trim().to_string();
-        if content.is_empty() {
-            continue;
-        }
 
         let kind = kind.ok_or_else(|| {
-            Mem8Error::InvalidInput("a memory section is missing its 'kind' field".into())
+            Mem8Error::InvalidInput(format!(
+                "section '{heading_id}' is missing its 'kind' field"
+            ))
         })?;
 
-        memories.push(NewMemory {
-            project: if project.is_empty() { "default".into() } else { project },
-            kind,
-            content,
-            tags,
-        });
+        if project.is_empty() {
+            return Err(Mem8Error::InvalidInput(format!(
+                "section '{heading_id}' is missing its 'project' field"
+            )));
+        }
+
+        if content.is_empty() {
+            return Err(Mem8Error::InvalidInput(format!(
+                "section '{heading_id}' has no content"
+            )));
+        }
+
+        memories.push(NewMemory { project, kind, content, tags });
     }
 
     Ok(memories)
@@ -205,5 +218,30 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].content, content);
         assert_eq!(parsed[0].project, "mem8");
+    }
+
+    #[test]
+    fn missing_project_in_a_file_is_an_error() {
+        let text = "## 7a1f7a1f-7a1f-7a1f-7a1f-7a1f7a1f7a1f\n- kind: decision\n- tags:\n- created: 2026-08-11T00:00:00+00:00\n\nBody.\n";
+        let err = from_markdown(text).unwrap_err().to_string();
+        assert!(err.contains("project"), "error should mention 'project', got: {err}");
+    }
+
+    #[test]
+    fn section_with_no_content_is_an_error() {
+        let text = "## 7a1f7a1f-7a1f-7a1f-7a1f-7a1f7a1f7a1f\n- project: p\n- kind: decision\n- tags:\n- created: 2026-08-11T00:00:00+00:00\n";
+        let err = from_markdown(text).unwrap_err().to_string();
+        assert!(
+            err.contains("7a1f7a1f-7a1f-7a1f-7a1f-7a1f7a1f7a1f"),
+            "error should identify the offending section, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trailing_whitespace_after_last_memory_is_not_an_error() {
+        let text = "## 7a1f7a1f-7a1f-7a1f-7a1f-7a1f7a1f7a1f\n- project: p\n- kind: decision\n- tags:\n- created: 2026-08-11T00:00:00+00:00\n\nBody.\n\n\n   \n\n";
+        let parsed = from_markdown(text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].content, "Body.");
     }
 }
