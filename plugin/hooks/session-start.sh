@@ -23,6 +23,6 @@ if ! command -v mem8 >/dev/null 2>&1; then
   exit 0
 fi
 
-emit "Memory for this session is provided by mem8, through its MCP tools. Use \`search_memory\` before concluding that something is unknown or was never decided: memories from earlier sessions are not otherwise visible to you. Use \`add_memory\` when a decision, preference, convention, fact, or learning is worth recalling in a later session. Search with two or three distinctive keywords rather than a sentence, because every word must appear in a memory for it to match; if nothing comes back, search again with different words. Do not write memory files to disk: mem8 is the store."
+emit "Memory for this session is provided by mem8, through its MCP tools. Call \`search_memory\` at the start of any task or question that could have prior context: past decisions, preferences, conventions, or anything the user says they told you before. Do this even when you could answer from the code, because the reasoning behind a decision is usually recorded only in memory. Searching and finding nothing is cheap; answering from the code and contradicting a past decision is not. Call \`add_memory\` when a decision, preference, convention, fact, or learning is worth recalling in a later session. Search with two or three distinctive keywords rather than a sentence, because every word must appear in a memory for it to match; if nothing comes back, search again with different words. Do not write memory files to disk: mem8 is the store."
 
 exit 0
