@@ -6,3 +6,7 @@
 
 # Scratch from the subagent-driven development workflow
 /.superpowers/
+
+# Local memory exports
+/mem.md
+*.mem.md

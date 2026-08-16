@@ -8,13 +8,47 @@ carrying every project's notes into every conversation.
 
 ## Install
 
+You need [Rust](https://rustup.rs) and [Claude Code](https://claude.com/claude-code).
+There are no prebuilt binaries yet, so mem8 is compiled from source.
+
 ```bash
+git clone https://github.com/rinnguyen711/mem8
+cd mem8
+
+# 1. Build and install the binary
 cargo install --path .
+
+# 2. Install the plugin: registers the MCP server and points the agent at it
+claude plugin marketplace add ./
+claude plugin install mem8@mem8
 ```
 
-## Use with Claude Code
+Restart Claude Code afterwards — MCP tools are registered when a session starts.
 
-Add to your MCP configuration:
+The order matters. The plugin runs the `mem8` binary, so installing the plugin
+first leaves it pointing at something that is not there yet.
+
+Verify:
+
+```bash
+mem8 --version               # 0.1.0
+claude mcp list | grep mem8  # mem8: mem8 serve - ✔ Connected
+```
+
+Then ask the agent to remember something. Memories go to `~/.mem8/mem8.db`,
+scoped automatically to the git repository you are working in.
+
+### Without the plugin
+
+The plugin is only a convenience: it declares the MCP server and tells the agent
+to prefer mem8 over Claude Code's own file-based memory. To wire the server up by
+hand instead:
+
+```bash
+claude mcp add --scope user mem8 -- mem8 serve
+```
+
+Or add it to your MCP configuration directly:
 
 ```json
 {
@@ -26,6 +60,15 @@ Add to your MCP configuration:
   }
 }
 ```
+
+### Updating
+
+```bash
+cargo install --path . --force
+```
+
+On Windows the running server holds a lock on `mem8.exe`, so stop it first with
+`taskkill /IM mem8.exe /F`.
 
 ## Tools
 
@@ -115,9 +158,34 @@ laptop, which is the common case.
 Run `cargo fmt` before every commit.
 ```
 
+## Status
+
+Version 0.1.0. It works, and it is used daily by its author — but it is young,
+and these are the things worth knowing before you rely on it.
+
+**Search is keyword-only.** Every word in a query must appear in a memory for it
+to match, so a memory recorded as "we chose the porter tokenizer" is not found by
+"why did we pick the porter tokenizer" — `chose` and `pick` are different words.
+Search with two or three distinctive keywords and try different words if nothing
+comes back. Semantic search is the obvious next step; the schema reserves an
+`embedding` column for it.
+
+**Only tested on Windows.** The code has no platform-specific logic and the test
+suite should pass anywhere, but nobody has run it on macOS or Linux yet.
+
+**Postgres is newer than SQLite.** Both satisfy the same contract suite, verified
+against a real server, but SQLite is the default and has had far more use.
+
 ## Development
 
 ```bash
 cargo test                                              # SQLite only
 MEM8_TEST_PG=postgres://localhost/mem8_test cargo test  # includes Postgres
 ```
+
+The test suite covers the storage backends against a shared contract, the core
+service, the MCP tool surface, an end-to-end handshake against the real binary
+over stdio, and an export/import round trip.
+
+`docs/superpowers/` holds the design spec and the implementation plan the project
+was built from, if you want the reasoning behind a decision.
