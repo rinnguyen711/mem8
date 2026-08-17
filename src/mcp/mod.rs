@@ -86,10 +86,15 @@ fn render_hits(hits: &[SearchHit]) -> String {
     }
     hits.iter()
         .map(|h| {
+            // Results already arrive best-first, but without the score every hit
+            // reads as equally relevant, so a vague query looks the same as an
+            // exact one. Showing it lets the caller tell a strong match from the
+            // long tail below it.
             format!(
-                "[{}] ({}) {}\n  id: {}  project: {}  tags: {}",
+                "[{}] ({}, score {:.3}) {}\n  id: {}  project: {}  tags: {}",
                 h.memory.created_at.format("%Y-%m-%d"),
                 h.memory.kind,
+                h.score,
                 h.memory.content,
                 h.memory.id,
                 h.memory.project,
@@ -295,6 +300,10 @@ mod tests {
 
         let text = result_text(&result);
         assert!(text.contains("we chose rust"), "got: {text}");
+        assert!(
+            text.contains("score "),
+            "a hit should carry its relevance score, got: {text}"
+        );
     }
 
     /// `kind` is now the real `Kind` enum, so an unrecognized value can no

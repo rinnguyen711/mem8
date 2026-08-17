@@ -2,6 +2,12 @@
 name = "mem8"
 version = "0.1.0"
 edition = "2021"
+description = "Persistent, project-scoped memory for AI coding agents, served over the Model Context Protocol."
+license = "MIT"
+repository = "https://github.com/rinnguyen711/mem8"
+readme = "README.md"
+keywords = ["mcp", "memory", "agent", "sqlite", "postgres"]
+categories = ["command-line-utilities", "database"]
 
 [lib]
 name = "mem8"

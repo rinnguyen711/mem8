@@ -85,6 +85,17 @@ On Windows the running server holds a lock on `mem8.exe`, so stop it first with
 protocol-level error naming all five valid values — not as a normal tool
 result.
 
+Search results are ordered best-first and carry a relevance score, so a strong
+match is distinguishable from the long tail beneath it:
+
+```
+[2026-08-16] (decision, score 1.163) mem8 ships as a Claude Code plugin...
+[2026-08-16] (decision, score 0.812) Removed the mem0 plugin and marketplace...
+```
+
+The scale differs by backend — SQLite reports a negated BM25 score, Postgres a
+`ts_rank` value — so compare scores within one result set, not across backends.
+
 Project scope is detected automatically from the git root of the working
 directory (its directory name), falling back to the working directory's own
 name if there is no `.git`. Pass `project` to override it, or `global: true`
@@ -100,10 +111,9 @@ on `search_memory` to search across every project.
   `sqlite:///home/me/mem8.db`)
 - `postgres://user@host/db` or `postgresql://user@host/db` — Postgres
 
-Postgres support is compile-verified only: the code builds and the contract
-tests are written against it, but it has not been exercised against a live
-Postgres server during development. Treat it as experimental until you've
-tried it against your own database.
+Both backends satisfy the same contract suite, run against a real server. SQLite
+is the default and has seen far more use, so treat Postgres as the newer of the
+two.
 
 ## Backup
 
@@ -189,3 +199,7 @@ over stdio, and an export/import round trip.
 
 `docs/superpowers/` holds the design spec and the implementation plan the project
 was built from, if you want the reasoning behind a decision.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
