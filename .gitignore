@@ -9,4 +9,6 @@
 
 # Local memory exports
 /mem.md
+/memories.md
 *.mem.md
+*-export.md
