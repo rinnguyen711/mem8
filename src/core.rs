@@ -8,6 +8,83 @@ use uuid::Uuid;
 pub const DEFAULT_LIMIT: usize = 10;
 pub const MAX_LIMIT: usize = 50;
 
+/// Word overlap above which `add` revises an existing memory instead of storing
+/// a new one.
+///
+/// Deliberately near-identical. Overlap is measured on words, so it recognises
+/// the same sentence saved twice but not the same idea worded differently:
+/// measured against real data, two memories both recording the choice of the
+/// porter tokenizer scored 0.14, indistinguishable from unrelated pairs. A
+/// threshold low enough to catch that would also merge memories that merely
+/// share vocabulary, and merging discards the older content. Catching literal
+/// re-saves is the part that can be done safely without semantic similarity.
+pub const DUPLICATE_THRESHOLD: f64 = 0.8;
+
+/// Record a search that found nothing, for working out what recall is missing.
+///
+/// Keyword search fails in two distinguishable ways: the query used words that
+/// are simply absent, or it used a synonym of words that are present. Only the
+/// second is an argument for semantic search, and the difference is visible only
+/// in real queries. Logging both, with the sanitized form beside the original,
+/// is what turns that question into evidence.
+///
+/// Writes to `~/.mem8/missed-searches.log` and never leaves the machine. Any
+/// failure is ignored: a search must not break because a log file could not be
+/// written. Set `MEM8_NO_MISS_LOG` to turn it off.
+fn log_missed_search(raw: &str, sanitized: &str, project: &str) {
+    use std::io::Write;
+
+    if std::env::var_os("MEM8_NO_MISS_LOG").is_some() {
+        return;
+    }
+
+    let Some(home) = dirs::home_dir() else { return };
+    let dir = home.join(".mem8");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    let line = format!(
+        "{}\t{}\t{}\t{}\n",
+        chrono::Utc::now().to_rfc3339(),
+        project,
+        raw.replace(['\t', '\n'], " "),
+        sanitized.replace(['\t', '\n'], " "),
+    );
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("missed-searches.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Fraction of words two texts share, ignoring order, case, and punctuation.
+///
+/// Returns 0.0 when either side has no words, so an empty string is never a
+/// duplicate of anything.
+fn word_overlap(a: &str, b: &str) -> f64 {
+    fn words(s: &str) -> std::collections::HashSet<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_lowercase())
+            .collect()
+    }
+
+    let (a, b) = (words(a), words(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+
+    let union = a.union(&b).count();
+    if union == 0 {
+        return 0.0;
+    }
+    a.intersection(&b).count() as f64 / union as f64
+}
+
 /// Sanitize a raw agent query into a safe FTS query string.
 ///
 /// FTS5 and `plainto_tsquery` both parse their input, and unbalanced quotes or
@@ -114,14 +191,57 @@ impl Memory8 {
             return Err(Mem8Error::InvalidInput("content must not be empty".into()));
         }
 
+        let content = content.trim().to_string();
+        let project = self.resolve_scope(project);
+
+        // Revise a near-identical memory rather than storing it twice. Only the
+        // resolved project is considered, so this can never merge across scopes.
+        if let Some(existing) = self.find_duplicate(&content, &project).await {
+            return self
+                .store
+                .update(
+                    existing.id,
+                    MemoryUpdate {
+                        content: Some(content),
+                        kind: Some(kind),
+                        tags: Some(tags),
+                    },
+                )
+                .await;
+        }
+
         self.store
-            .add(NewMemory {
-                project: self.resolve_scope(project),
-                kind,
-                content: content.trim().to_string(),
-                tags,
+            .add(NewMemory { project, kind, content, tags })
+            .await
+    }
+
+    /// The stored memory this content would duplicate, if any.
+    ///
+    /// Searches for the content's own terms and compares each candidate by word
+    /// overlap. A failed search is not an error here: duplicate detection is an
+    /// optimisation, and a query that cannot be parsed simply means the write
+    /// proceeds as a new memory.
+    async fn find_duplicate(&self, content: &str, project: &str) -> Option<Memory> {
+        let text = sanitize_fts_query(content).ok()?;
+
+        let hits = self
+            .store
+            .search(SearchQuery {
+                text,
+                project: Some(project.to_string()),
+                global: false,
+                kind: None,
+                tags: Vec::new(),
+                limit: MAX_LIMIT,
             })
             .await
+            .ok()?;
+
+        hits.into_iter()
+            .map(|hit| (word_overlap(content, &hit.memory.content), hit.memory))
+            .filter(|(overlap, _)| *overlap >= DUPLICATE_THRESHOLD)
+            .max_by(|(a, _), (b, _)| a.total_cmp(b))
+            .map(|(_, memory)| memory)
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Memory> {
@@ -167,10 +287,18 @@ impl Memory8 {
         let text = sanitize_fts_query(query)?;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let project = if global { None } else { Some(self.resolve_scope(project)) };
+        let scope = project.clone().unwrap_or_else(|| "*".to_string());
 
-        self.store
-            .search(SearchQuery { text, project, global, kind, tags, limit })
-            .await
+        let hits = self
+            .store
+            .search(SearchQuery { text: text.clone(), project, global, kind, tags, limit })
+            .await?;
+
+        if hits.is_empty() {
+            log_missed_search(query, &text, &scope);
+        }
+
+        Ok(hits)
     }
 
     /// Every memory, for `mem8 export`.
@@ -319,6 +447,85 @@ mod tests {
         let cleaned = sanitize_fts_query("say\"hi").unwrap();
         assert_eq!(cleaned, "\"say\"\"hi\"");
         assert_eq!(cleaned.matches('"').count() % 2, 0, "quotes must balance");
+    }
+
+    #[tokio::test]
+    async fn adding_the_same_content_twice_revises_one_memory() {
+        let svc = service();
+        let first = svc
+            .add("We chose the porter tokenizer.", Kind::Decision, vec![], Some("p1".into()))
+            .await
+            .unwrap();
+        let second = svc
+            .add("We chose the porter tokenizer.", Kind::Decision, vec![], Some("p1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(second.id, first.id, "a re-save should revise, not duplicate");
+        assert_eq!(svc.all().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn differently_worded_memories_are_kept_apart() {
+        // These two record the same decision but share few words. Merging them
+        // would discard content, so the threshold deliberately does not reach
+        // this far -- it is the case only semantic similarity can catch.
+        let svc = service();
+        svc.add(
+            "We chose the porter tokenizer so both backends stem identically.",
+            Kind::Decision,
+            vec![],
+            Some("p1".into()),
+        )
+        .await
+        .unwrap();
+        svc.add(
+            "mem8 uses SQLite FTS5 with porter, matching how Postgres stems.",
+            Kind::Decision,
+            vec![],
+            Some("p1".into()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(svc.all().await.unwrap().len(), 2, "distinct wording must not merge");
+    }
+
+    #[tokio::test]
+    async fn duplicate_detection_does_not_cross_projects() {
+        let svc = service();
+        svc.add("Run cargo fmt before committing.", Kind::Convention, vec![], Some("p1".into()))
+            .await
+            .unwrap();
+        svc.add("Run cargo fmt before committing.", Kind::Convention, vec![], Some("p2".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            svc.all().await.unwrap().len(),
+            2,
+            "identical content in different projects is not a duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_that_finds_nothing_still_succeeds() {
+        // The miss log is best-effort; a search must return Ok either way.
+        let svc = service();
+        svc.add("we chose rust", Kind::Decision, vec![], Some("p1".into())).await.unwrap();
+
+        let hits = svc
+            .search("kubernetes", Some("p1".into()), false, None, vec![], None)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn word_overlap_ignores_case_order_and_punctuation() {
+        assert_eq!(word_overlap("Porter tokenizer, chosen.", "chosen porter TOKENIZER"), 1.0);
+        assert_eq!(word_overlap("", "anything"), 0.0);
+        assert!(word_overlap("we chose porter", "we picked snowball") < 0.5);
     }
 
     #[tokio::test]

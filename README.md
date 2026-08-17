@@ -96,6 +96,16 @@ match is distinguishable from the long tail beneath it:
 The scale differs by backend — SQLite reports a negated BM25 score, Postgres a
 `ts_rank` value — so compare scores within one result set, not across backends.
 
+Storing content that is near-identical to an existing memory in the same project
+revises that memory instead of creating a second copy. The comparison is word
+overlap, so it catches the same text saved twice but not the same idea worded
+differently — that needs semantic similarity, which v1 does not have.
+
+Searches that return nothing are appended to `~/.mem8/missed-searches.log` with
+the query and its sanitized form, which is what shows whether a miss was a
+synonym problem or genuinely absent content. It stays on your machine; set
+`MEM8_NO_MISS_LOG` to turn it off.
+
 Project scope is detected automatically from the git root of the working
 directory (its directory name), falling back to the working directory's own
 name if there is no `.git`. Pass `project` to override it, or `global: true`
