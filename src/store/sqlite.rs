@@ -328,6 +328,17 @@ impl Store for SqliteStore {
             backend: "the SQLite backend".into(),
         })
     }
+
+    /// Temporarily unsupported: the real implementation arrives with the
+    /// schema-2 `superseded_by` / `invalid_at` columns. An error rather than a
+    /// panic, so the intermediate state is visible to a caller instead of
+    /// taking the process down.
+    async fn supersede(&self, _old: Uuid, _new: Option<Uuid>, _at: DateTime<Utc>) -> Result<()> {
+        Err(Mem8Error::Unsupported {
+            feature: "supersession".into(),
+            backend: "the SQLite backend".into(),
+        })
+    }
 }
 
 #[cfg(test)]

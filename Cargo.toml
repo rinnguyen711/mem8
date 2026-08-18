@@ -2,6 +2,10 @@
 name = "mem8"
 version = "0.1.0"
 edition = "2021"
+# `Option::is_none_or`, used by the store filter predicates, stabilised in
+# 1.82. Declared so an older toolchain reports an unmet MSRV instead of a
+# confusing "no method named `is_none_or`".
+rust-version = "1.82"
 description = "Persistent, project-scoped memory for AI coding agents, served over the Model Context Protocol."
 license = "MIT"
 repository = "https://github.com/rinnguyen711/mem8"

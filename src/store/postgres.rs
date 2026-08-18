@@ -475,4 +475,15 @@ impl Store for PgStore {
         }
         Ok(())
     }
+
+    /// Temporarily unsupported: the real implementation arrives with the
+    /// Postgres supersession columns. An error rather than a panic, so the
+    /// intermediate state is visible to a caller instead of taking the process
+    /// down.
+    async fn supersede(&self, _old: Uuid, _new: Option<Uuid>, _at: DateTime<Utc>) -> Result<()> {
+        Err(Mem8Error::Unsupported {
+            feature: "supersession".into(),
+            backend: "the Postgres backend".into(),
+        })
+    }
 }

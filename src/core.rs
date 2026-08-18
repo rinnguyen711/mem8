@@ -1140,6 +1140,14 @@ mod tests {
             async fn set_embedding(&self, _id: Uuid, _e: &[f32]) -> Result<()> {
                 Ok(())
             }
+            async fn supersede(
+                &self,
+                old: Uuid,
+                new: Option<Uuid>,
+                at: chrono::DateTime<chrono::Utc>,
+            ) -> Result<()> {
+                self.0.supersede(old, new, at).await
+            }
         }
 
         let svc =
