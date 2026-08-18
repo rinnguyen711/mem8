@@ -1,4 +1,4 @@
-use crate::core::Memory8;
+use crate::core::{Memory8, SearchOptions};
 #[allow(unused_imports)]
 use crate::error::Mem8Error;
 use crate::model::{Kind, SearchHit};
@@ -175,11 +175,14 @@ impl Mem8Server {
                 .service
                 .search(
                     &p.query,
-                    p.project,
-                    p.global.unwrap_or(false),
-                    p.kind,
-                    p.tags.unwrap_or_default(),
-                    p.limit,
+                    SearchOptions {
+                        project: p.project,
+                        global: p.global.unwrap_or(false),
+                        kind: p.kind,
+                        tags: p.tags.unwrap_or_default(),
+                        limit: p.limit,
+                        ..Default::default()
+                    },
                 )
                 .await
             {

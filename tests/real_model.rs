@@ -11,7 +11,7 @@
 
 #![cfg(feature = "semantic")]
 
-use mem8::core::Memory8;
+use mem8::core::{Memory8, SearchOptions};
 use mem8::embed::{cosine_similarity, Embed, Embedder, EMBEDDING_DIM};
 use mem8::model::Kind;
 use mem8::store::MemStore;
@@ -106,7 +106,13 @@ async fn an_exact_identifier_still_ranks_first() {
         .unwrap();
 
     let hits = service
-        .search("SqliteStore", Some("p1".into()), false, None, vec![], None)
+        .search(
+            "SqliteStore",
+            SearchOptions {
+                project: Some("p1".into()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -151,11 +157,10 @@ async fn semantic_search_finds_what_keywords_miss() {
     let hits = service
         .search(
             "why did we pick that word splitter",
-            Some("p1".into()),
-            false,
-            None,
-            vec![],
-            None,
+            SearchOptions {
+                project: Some("p1".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
