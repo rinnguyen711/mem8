@@ -562,6 +562,10 @@ Add to `trait Store` in `src/store/mod.rs`:
     async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()>;
 ```
 
+**Writing temporal tests: `created_at` and `invalid_at` have different precision.** `created_at` is stored raw from `Utc::now()`; `invalid_at` is truncated to microseconds, and truncation only ever moves a value *earlier*. So the validity window `[created_at, invalid_at)` can be zero-width or even negative when two writes land inside one microsecond — meaning a probe instant derived as the midpoint of that window has no valid value, not merely a narrow margin. This is dormant on macOS, where `Utc::now()` is already microsecond-resolution, and live on Linux.
+
+Never derive a temporal probe by bisecting that window. Instead call `supersede` with an explicit `at` — `old.created_at + Duration::seconds(10)` — so the window is wide by construction at any clock resolution, and pick probe instants at fixed offsets inside it. Task 5's contract suite does this; two later tasks reached for the midpoint and had to be corrected.
+
 **Both backends truncate `at` to microsecond precision before storing.** Postgres's `TIMESTAMPTZ` holds only microseconds while SQLite's RFC3339 text holds nanoseconds, so an untruncated instant makes the two disagree about an `as_of` that falls between the truncated and the full value — measured as 1 hit on SQLite versus 0 on Postgres. Dormant on macOS, where `Utc::now()` is already microsecond-resolution; live on Linux, where it is not. Callers pass whatever instant they have and the store normalises, so no caller — including Task 7's write path and Task 11's import — needs to know.
 
 Add `use chrono::{DateTime, Utc};` to the imports (the file currently imports only `Utc`).
