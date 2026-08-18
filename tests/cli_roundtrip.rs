@@ -23,15 +23,33 @@ async fn export_then_import_reproduces_every_memory() {
     {
         let service = Memory8::new(mem8::store::open_from_env().await.unwrap());
         service
-            .add("We chose Rust.", Kind::Decision, vec!["lang".into()], Some("p1".into()))
+            .add(
+                "We chose Rust.",
+                Kind::Decision,
+                vec!["lang".into()],
+                Some("p1".into()),
+                None,
+            )
             .await
             .unwrap();
         service
-            .add("Tests use cargo test.", Kind::Convention, vec![], Some("p1".into()))
+            .add(
+                "Tests use cargo test.",
+                Kind::Convention,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
             .await
             .unwrap();
         service
-            .add("Multi\n\nparagraph body.", Kind::Fact, vec!["a".into(), "b".into()], Some("p2".into()))
+            .add(
+                "Multi\n\nparagraph body.",
+                Kind::Fact,
+                vec!["a".into(), "b".into()],
+                Some("p2".into()),
+                None,
+            )
             .await
             .unwrap();
     }

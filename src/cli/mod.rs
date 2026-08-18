@@ -74,7 +74,7 @@ pub async fn import(path: &Path) -> Result<usize> {
     let mut count = 0;
     for m in incoming {
         service
-            .add(&m.content, m.kind, m.tags, Some(m.project))
+            .add(&m.content, m.kind, m.tags, Some(m.project), None)
             .await?;
         count += 1;
     }

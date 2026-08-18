@@ -144,7 +144,14 @@ impl Mem8Server {
         Ok(
             match self
                 .service
-                .add(&p.content, p.kind, p.tags.unwrap_or_default(), p.project)
+                // Task 9 wires this to a real `supersedes` parameter.
+                .add(
+                    &p.content,
+                    p.kind,
+                    p.tags.unwrap_or_default(),
+                    p.project,
+                    None,
+                )
                 .await
             {
                 Ok(m) => ok(format!(

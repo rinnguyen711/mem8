@@ -90,6 +90,7 @@ async fn an_exact_identifier_still_ranks_first() {
             Kind::Fact,
             vec![],
             Some("p1".into()),
+            None,
         )
         .await
         .unwrap();
@@ -99,6 +100,7 @@ async fn an_exact_identifier_still_ranks_first() {
             Kind::Fact,
             vec![],
             Some("p1".into()),
+            None,
         )
         .await
         .unwrap();
@@ -129,6 +131,7 @@ async fn semantic_search_finds_what_keywords_miss() {
             Kind::Decision,
             vec![],
             Some("p1".into()),
+            None,
         )
         .await
         .unwrap();
@@ -140,7 +143,7 @@ async fn semantic_search_finds_what_keywords_miss() {
         "Memories are scoped to the git root directory name.",
     ] {
         service
-            .add(filler, Kind::Convention, vec![], Some("p1".into()))
+            .add(filler, Kind::Convention, vec![], Some("p1".into()), None)
             .await
             .unwrap();
     }
