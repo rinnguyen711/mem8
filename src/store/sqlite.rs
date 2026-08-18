@@ -367,6 +367,8 @@ mod tests {
             kind: None,
             tags: vec![],
             limit: 10,
+            include_superseded: false,
+            as_of: None,
         }
     }
 

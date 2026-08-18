@@ -67,6 +67,8 @@ fn query(embedding: Vec<f32>, project: &str) -> VectorQuery {
         kind: None,
         tags: vec![],
         limit: 10,
+        include_superseded: false,
+        as_of: None,
     }
 }
 

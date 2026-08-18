@@ -134,6 +134,17 @@ pub struct SearchQuery {
     pub kind: Option<Kind>,
     pub tags: Vec<String>,
     pub limit: usize,
+    /// Return superseded memories alongside live ones. Defaults to false:
+    /// discovery should surface what is currently true.
+    pub include_superseded: bool,
+    /// Answer as of a past instant — what was believed then.
+    ///
+    /// Mutually exclusive with `include_superseded` and rejected together at
+    /// the tool boundary: `as_of` already specifies exactly which rows count,
+    /// so combining them is a contradiction rather than a refinement. Stores
+    /// resolve it by letting `as_of` win rather than trusting the boundary,
+    /// so a direct caller cannot produce a nonsense result.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 /// A search by embedding similarity rather than by words.
@@ -150,6 +161,17 @@ pub struct VectorQuery {
     pub kind: Option<Kind>,
     pub tags: Vec<String>,
     pub limit: usize,
+    /// Return superseded memories alongside live ones. Defaults to false:
+    /// discovery should surface what is currently true.
+    pub include_superseded: bool,
+    /// Answer as of a past instant — what was believed then.
+    ///
+    /// Mutually exclusive with `include_superseded` and rejected together at
+    /// the tool boundary: `as_of` already specifies exactly which rows count,
+    /// so combining them is a contradiction rather than a refinement. Stores
+    /// resolve it by letting `as_of` win rather than trusting the boundary,
+    /// so a direct caller cannot produce a nonsense result.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,5 +260,34 @@ mod tests {
         for k in Kind::ALL {
             assert_eq!(k.to_string().parse::<Kind>().unwrap(), k);
         }
+    }
+
+    #[test]
+    fn query_defaults_hide_superseded_and_set_no_as_of() {
+        let q = SearchQuery {
+            text: "x".into(),
+            project: None,
+            global: false,
+            kind: None,
+            tags: vec![],
+            limit: 10,
+            include_superseded: false,
+            as_of: None,
+        };
+        assert!(!q.include_superseded);
+        assert!(q.as_of.is_none());
+
+        let v = VectorQuery {
+            embedding: vec![0.0; 3],
+            project: None,
+            global: false,
+            kind: None,
+            tags: vec![],
+            limit: 10,
+            include_superseded: false,
+            as_of: None,
+        };
+        assert!(!v.include_superseded);
+        assert!(v.as_of.is_none());
     }
 }

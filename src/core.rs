@@ -381,6 +381,8 @@ impl Memory8 {
                 kind: None,
                 tags: Vec::new(),
                 limit: MAX_LIMIT,
+                include_superseded: false,
+                as_of: None,
             })
             .await
             .ok()?;
@@ -470,6 +472,8 @@ impl Memory8 {
                 kind,
                 tags: tags.clone(),
                 limit,
+                include_superseded: false,
+                as_of: None,
             })
             .await?;
 
@@ -519,6 +523,8 @@ impl Memory8 {
                 kind,
                 tags: tags.to_vec(),
                 limit,
+                include_superseded: false,
+                as_of: None,
             })
             .await
         {
