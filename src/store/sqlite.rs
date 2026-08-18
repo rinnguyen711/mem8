@@ -331,6 +331,29 @@ impl Store for SqliteStore {
             sql.push_str(&format!(" AND m.kind = ?{}", binds.len()));
         }
 
+        // Three modes, one predicate. `as_of` already specifies exactly which
+        // rows count, so it takes precedence over `include_superseded`; the
+        // tool boundary rejects a caller that sets both, but the store stays
+        // total over its input.
+        match query.as_of {
+            Some(t) => {
+                // Bound once: both comparisons must use the identical string,
+                // which is the property the text-ordering argument rests on.
+                let t_str = t.to_rfc3339();
+                binds.push(Box::new(t_str.clone()));
+                sql.push_str(&format!(" AND m.created_at <= ?{}", binds.len()));
+                binds.push(Box::new(t_str));
+                sql.push_str(&format!(
+                    " AND (m.invalid_at IS NULL OR m.invalid_at > ?{})",
+                    binds.len()
+                ));
+            }
+            None if !query.include_superseded => {
+                sql.push_str(" AND m.invalid_at IS NULL");
+            }
+            None => {}
+        }
+
         sql.push_str(" ORDER BY score");
 
         let conn = self.conn.lock().unwrap();
@@ -380,6 +403,10 @@ impl Store for SqliteStore {
     /// rather than an empty result is the point — an empty Vec would be
     /// indistinguishable from "nothing matched", and a caller would silently
     /// believe it had searched semantically when it had not.
+    ///
+    /// If this ever gains a real implementation, it must apply the identical
+    /// `as_of` / `include_superseded` predicate that `search` applies above,
+    /// so the two search paths agree on what counts as live.
     async fn vector_search(&self, _query: VectorQuery) -> Result<Vec<SearchHit>> {
         Err(Mem8Error::Unsupported {
             feature: "semantic search".into(),
