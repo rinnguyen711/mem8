@@ -224,9 +224,11 @@ Add to **both** `SearchQuery` and `VectorQuery` in `src/model.rs`:
     pub include_superseded: bool,
     /// Answer as of a past instant — what was believed then.
     ///
-    /// Mutually exclusive with `include_superseded`: `as_of` already specifies
-    /// exactly which rows count, so combining them is a contradiction rather
-    /// than a refinement. Rejected at the tool boundary, not silently resolved.
+    /// Mutually exclusive with `include_superseded` and rejected together at
+    /// the tool boundary: `as_of` already specifies exactly which rows count,
+    /// so combining them is a contradiction rather than a refinement. Stores
+    /// resolve it by letting `as_of` win rather than trusting the boundary,
+    /// so a direct caller cannot produce a nonsense result.
     pub as_of: Option<DateTime<Utc>>,
 ```
 
