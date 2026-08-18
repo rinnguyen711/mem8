@@ -1952,6 +1952,8 @@ between superseding a memory and deleting it.
 Two ways to see past state:
 
 - `include_superseded: true` returns replaced memories alongside live ones.
+  Superseded entries are marked in the result, so a retracted decision cannot
+  be mistaken for the current one.
 - `as_of: "2026-08-01T00:00:00Z"` returns what was believed at that time.
 
 The two cannot be combined — `as_of` already determines which memories count.
