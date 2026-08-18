@@ -72,7 +72,8 @@ pub async fn import(path: &Path) -> Result<usize> {
     let service = Arc::new(Memory8::new(store));
 
     let mut count = 0;
-    for m in incoming {
+    for parsed in incoming {
+        let m = parsed.new;
         service
             .add(&m.content, m.kind, m.tags, Some(m.project), None)
             .await?;
