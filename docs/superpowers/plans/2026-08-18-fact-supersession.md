@@ -756,7 +756,9 @@ The three modes:
 
 Adapt the clause/param accumulation to whatever the function actually uses (it may use a `Vec<String>` of conditions and a `params_from_iter` call). Use the table alias the existing query uses — drop `m.` if there is none.
 
-Timestamps are stored as RFC3339 text, and RFC3339 with a fixed `+00:00` offset compares correctly as a string. Confirm the existing `created_at` comparisons rely on the same property; if the file normalises timestamps before comparison, do the same here.
+Timestamps are stored as RFC3339 text, and RFC3339 with a fixed `+00:00` offset compares correctly as a string — verified against a 200,000-pair fuzz during the Task 3-4 review, including nanosecond, microsecond, and millisecond boundaries. The `.` separator sorts below every digit, so a whole second correctly precedes any fractional value at the same second.
+
+**This holds only for the `+00:00` form.** Bind `as_of` with plain `to_rfc3339()`. The `Z` form breaks ordering silently — `'Z'` (0x5A) > `'+'` (0x2B), so the same instant compares as *later* — and no existing test would catch it. Never use `to_rfc3339_opts(.., use_z = true)` for a value compared against these columns.
 
 - [ ] **Step 4: Add the predicate to SQLite's vector_search**
 
@@ -926,6 +928,11 @@ Add the same three-mode predicate to `search` and `vector_search`, using `$n` pl
 ```
 
 Bind the `as_of` timestamp once and reference it twice, or bind it twice — follow whichever the surrounding code makes natural. `vector_search` needs it too: a semantic search that ignored supersession would surface dead facts that keyword search correctly hides.
+
+**Two divergence traps, both confirmed by review of Tasks 3-4:**
+
+- **Use `TIMESTAMPTZ` for `invalid_at`, not TEXT.** SQLite stores it as RFC3339 text because that is what its other timestamps are; Postgres's `created_at`/`updated_at` are already `TIMESTAMPTZ`. Matching SQLite's TEXT here would give Postgres a text-comparison fragility it has no reason to carry. Both are temporally correct, so results still agree.
+- **The predicate must go in the same SQL statement as the `LIMIT`.** Postgres applies `LIMIT` in SQL, so adding the temporal filter as a post-filter in Rust would truncate before filtering and diverge from both `MemStore` and SQLite, which filter before `.take(limit)`.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
