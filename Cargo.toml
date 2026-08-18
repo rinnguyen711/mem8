@@ -72,6 +72,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 # stack, so the suite builds without OpenSSL headers.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
+# The migration suite hand-writes a v1 database, which needs the same SQLite
+# bindings the store uses. A normal dependency is not visible to integration
+# test targets, so it is repeated here with matching version and features.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 test-support = []
