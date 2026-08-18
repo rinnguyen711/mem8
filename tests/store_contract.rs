@@ -1,3 +1,4 @@
+use chrono::SubsecRound;
 use mem8::core::sanitize_fts_query;
 use mem8::model::{Kind, MemoryUpdate, NewMemory, SearchQuery};
 use mem8::store::sqlite::SqliteStore;
@@ -158,12 +159,13 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
 
     // --- Supersession ---------------------------------------------------
     //
-    // Gated on an explicit capability flag rather than a probe write: Task 6
-    // still has Postgres's `supersede` returning `Unsupported`, and flipping
-    // `supports.supersede` to `true` at that call site is a required step of
-    // that task (grep for `supersede: false` below). Using a block rather
-    // than an early `return` means anything appended after this section
-    // keeps running on every backend, including ones that skip this block.
+    // Gated on an explicit capability flag rather than a probe write, so a
+    // backend without supersession says so out loud at its call site instead
+    // of the contract quietly shrinking. Both shipped backends now pass
+    // `true`; the flag and its `else` branch remain for a future third one.
+    // Using a block rather than an early `return` means anything appended
+    // after this section keeps running on every backend, including ones that
+    // skip this block.
     if supports.supersede {
         let old = store
             .add(new_memory("p1", Kind::Decision, "storage is sqlite", &[]))
@@ -205,11 +207,32 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
         assert!(both_ids.contains(&old.id), "include_superseded must still return the old fact");
         assert!(both_ids.contains(&replacement.id), "include_superseded must return the replacement too");
 
-        // Superseding a memory that does not exist is NotFound.
-        assert!(store
-            .supersede(uuid::Uuid::new_v4(), Some(replacement.id), at)
-            .await
-            .is_err());
+        // The NotFound / InvalidInput split is the subtlest part of
+        // `supersede`, so assert the variants rather than just `is_err()`:
+        // "no such id" and "already superseded" are different problems for a
+        // caller, and a backend that collapsed them would still pass an
+        // `is_err()` check.
+        assert!(
+            matches!(
+                store
+                    .supersede(uuid::Uuid::new_v4(), Some(replacement.id), at)
+                    .await,
+                Err(mem8::error::Mem8Error::NotFound(_))
+            ),
+            "superseding an unknown id must be NotFound"
+        );
+        assert!(
+            matches!(
+                store.supersede(old.id, None, at).await,
+                Err(mem8::error::Mem8Error::InvalidInput(_))
+            ),
+            "a second supersede must be InvalidInput, not a silent overwrite"
+        );
+        assert_eq!(
+            store.get(old.id).await.unwrap().invalid_at,
+            fetched.invalid_at,
+            "a rejected second supersede must not move invalid_at"
+        );
 
         // as_of: before, exactly at, and after the invalidation boundary.
         let t_before = old.created_at + chrono::Duration::seconds(5);
@@ -235,6 +258,49 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
         // After invalidation, excluded.
         let after = store.search(as_of(t_after)).await.unwrap();
         assert!(!after.iter().any(|h| h.memory.id == old.id));
+
+        // An invalidation instant is stored at microsecond precision on every
+        // backend.
+        //
+        // Postgres's TIMESTAMPTZ cannot hold more; SQLite's RFC3339 text can,
+        // and did, which made the two disagree about an `as_of` landing between
+        // the truncated and full values -- dead on one backend, live on the
+        // other. Invisible on macOS (`Utc::now()` is microsecond-resolution
+        // there) and live on Linux, so it needs a test that does not depend on
+        // the platform's clock: the nanosecond instant is constructed, not
+        // sampled.
+        let nano = store
+            .add(new_memory("p5", Kind::Fact, "precision probe", &[]))
+            .await
+            .unwrap();
+        let ragged = nano.created_at
+            + chrono::Duration::seconds(10)
+            + chrono::Duration::nanoseconds(123_456_789);
+        store.supersede(nano.id, None, ragged).await.unwrap();
+
+        let stored = store.get(nano.id).await.unwrap().invalid_at.unwrap();
+        assert_eq!(
+            stored.timestamp_subsec_nanos() % 1_000,
+            0,
+            "invalid_at must be truncated to microseconds, got {stored:?}"
+        );
+        assert_eq!(
+            stored,
+            ragged.trunc_subsecs(6),
+            "the stored instant must be the caller's, truncated -- not rounded \
+             up, and not the raw value"
+        );
+
+        // The `as_of` boundary sits at the truncated instant on every backend,
+        // so a query between the truncated and untruncated values resolves the
+        // same way everywhere: already dead.
+        let between = ragged - chrono::Duration::nanoseconds(289);
+        let hits = store.search(as_of(between)).await.unwrap();
+        assert!(
+            !hits.iter().any(|h| h.memory.id == nano.id),
+            "an as_of between the truncated and full instant must read as dead \
+             on every backend"
+        );
     } else {
         // If a backend grows a real `supersede`, this contract must start
         // exercising it. Asserting the stub is still a stub turns a forgotten
@@ -304,7 +370,5 @@ async fn postgres_satisfies_the_store_contract() {
 
     let store = mem8::store::postgres::PgStore::connect(&url).await.unwrap();
     store.reset_for_tests().await.unwrap();
-    // Task 6 flips this to `true` once Postgres grows real supersession
-    // columns and a working `supersede`; until then it stays `Unsupported`.
-    run_contract(&store, Supports { supersede: false }).await;
+    run_contract(&store, Supports { supersede: true }).await;
 }

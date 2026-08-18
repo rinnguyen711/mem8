@@ -128,6 +128,23 @@ async fn embedding_type(store: &PgStore) -> String {
     .unwrap()
 }
 
+/// The type Postgres reports for one `memories` column, or `None` when the
+/// column does not exist. Proves a migration added a real column of the
+/// intended type rather than the code merely reporting a default.
+async fn column_type(store: &PgStore, column: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT format_type(a.atttypid, a.atttypmod)
+         FROM pg_attribute a
+         WHERE a.attrelid = 'memories'::regclass
+           AND a.attname = $1
+           AND NOT a.attisdropped",
+    )
+    .bind(column)
+    .fetch_optional(store.pool_for_tests())
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn fresh_database_is_created_at_the_current_version() {
     let db = scratch_db!();
@@ -253,6 +270,19 @@ async fn a_v1_database_migrates_forward_keeping_its_rows() {
 
     assert_eq!(recorded_version(&store).await, PG_SCHEMA_VERSION);
     assert_eq!(embedding_type(&store).await, "vector(384)");
+
+    // A v1 database skips no step: MIGRATE_V2 and MIGRATE_V3 both run, in
+    // order, inside the one transaction. Asserting the v3 columns here makes
+    // that explicit rather than incidental -- a `found < 3` guard written as
+    // `found == 2` would still pass every other test in this file.
+    assert_eq!(
+        column_type(&store, "superseded_by").await.as_deref(),
+        Some("uuid")
+    );
+    assert_eq!(
+        column_type(&store, "invalid_at").await.as_deref(),
+        Some("timestamp with time zone")
+    );
 
     // The migration drops a column; it must not drop the row with it.
     let all = store.all().await.unwrap();
@@ -381,5 +411,82 @@ async fn a_v1_database_with_data_in_the_placeholder_column_is_not_silently_dropp
     );
 
     pool.close().await;
+    db.cleanup().await;
+}
+
+/// A v2 database — one an older binary left behind — must gain the
+/// supersession columns without disturbing its rows.
+///
+/// Built by running the current migration and then winding the recorded
+/// version back and dropping the v3 columns, rather than by pasting a v2
+/// `CREATE TABLE`: the v2 shape includes the pgvector column and its HNSW
+/// index, and re-spelling that here would drift from `SCHEMA`/`MIGRATE_V2`
+/// the moment either changes.
+#[tokio::test]
+async fn v2_to_v3_preserves_every_row_as_live() {
+    let db = scratch_db!();
+
+    let store = PgStore::connect(db.url()).await.unwrap();
+    let added = store
+        .add(NewMemory {
+            project: "p1".into(),
+            kind: Kind::Fact,
+            content: "written under schema v2".into(),
+            tags: vec!["t1".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    drop(store);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(db.url())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE memories DROP COLUMN IF EXISTS superseded_by;
+         ALTER TABLE memories DROP COLUMN IF EXISTS invalid_at;
+         UPDATE mem8_meta SET schema_version = 2;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // Reconnecting runs v2 -> v3.
+    let store = PgStore::connect(db.url()).await.unwrap();
+    assert_eq!(recorded_version(&store).await, PG_SCHEMA_VERSION);
+
+    // Assert the columns are physically back. Without this the test passes
+    // vacuously against a binary that reports `None` from a hardcoded literal
+    // rather than from a column it actually read.
+    assert_eq!(
+        column_type(&store, "superseded_by").await.as_deref(),
+        Some("uuid")
+    );
+    assert_eq!(
+        column_type(&store, "invalid_at").await.as_deref(),
+        Some("timestamp with time zone"),
+        "invalid_at must be TIMESTAMPTZ; TEXT would give Postgres a \
+         text-comparison fragility its other timestamps do not have"
+    );
+
+    let all = store.all().await.unwrap();
+    assert_eq!(all.len(), 1, "the migration must not lose rows");
+    assert_eq!(all[0].id, added.id);
+    assert_eq!(all[0].content, "written under schema v2");
+    assert_eq!(all[0].tags, vec!["t1".to_string()]);
+
+    // Pre-existing rows migrate to live, not to some default invalidation.
+    assert_eq!(all[0].superseded_by, None);
+    assert_eq!(all[0].invalid_at, None);
+
+    // And a live row stays findable by search, which now carries a temporal
+    // predicate that a botched migration would make exclude everything.
+    let found = store.get(added.id).await.unwrap();
+    assert_eq!(found.invalid_at, None);
+
+    drop(store);
     db.cleanup().await;
 }

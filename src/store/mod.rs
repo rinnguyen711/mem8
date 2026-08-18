@@ -4,7 +4,7 @@ pub mod sqlite;
 use crate::error::{Mem8Error, Result};
 use crate::model::{Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -72,7 +72,33 @@ pub trait Store: Send + Sync {
     /// not here: the store records the fact, it does not police intent. The
     /// write-once rule is the exception, because it protects the integrity of
     /// the record itself rather than the caller's intent.
+    ///
+    /// `at` is truncated to microseconds by every implementation — see
+    /// [`truncate_for_storage`]. A caller therefore cannot rely on
+    /// nanosecond precision surviving the write.
     async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()>;
+}
+
+/// Round an invalidation instant down to microsecond precision.
+///
+/// Postgres's `TIMESTAMPTZ` holds only microseconds, while SQLite stores the
+/// same field as RFC3339 text and keeps all nine digits. An untruncated instant
+/// therefore lands differently in the two backends, and an `as_of` falling
+/// between the truncated and full values reads the memory as dead on Postgres
+/// and live on SQLite — the backends disagreeing about a single instant.
+///
+/// The divergence is invisible on macOS, where `Utc::now()` is already
+/// microsecond-resolution, and live on Linux, where it returns true
+/// nanoseconds. That makes it exactly the kind of bug that passes locally and
+/// fails in CI, so it is fixed at the point of entry rather than documented:
+/// every `supersede` implementation truncates before storing, so all three
+/// agree regardless of which one a caller holds.
+///
+/// Truncating (rather than rounding to nearest) keeps the stored instant at or
+/// before the one the caller supplied, so an invalidation never moves later
+/// than the event it records.
+pub fn truncate_for_storage(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.trunc_subsecs(6)
 }
 
 /// In-memory `Store` used by `core` unit tests. Substring matching stands in
@@ -270,6 +296,9 @@ impl Store for MemStore {
     }
 
     async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()> {
+        // Truncated here as well, so `core` tests against `MemStore` observe
+        // the same precision they will get from a real backend.
+        let at = truncate_for_storage(at);
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .iter_mut()

@@ -1,4 +1,4 @@
-use super::Store;
+use super::{truncate_for_storage, Store};
 use crate::error::{Mem8Error, Result};
 use crate::model::{Kind, Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use async_trait::async_trait;
@@ -444,11 +444,17 @@ impl Store for SqliteStore {
         // `at` is written with plain `to_rfc3339()` (the `+00:00` form) because
         // the search predicates compare this column as text. See MIGRATE_V2.
         //
+        // Truncated to microseconds first. SQLite would happily keep all nine
+        // digits, but Postgres's TIMESTAMPTZ cannot, and a store-dependent
+        // precision makes the two disagree about an `as_of` between the
+        // truncated and full values. See `truncate_for_storage`.
+        //
         // This UPDATE fires the unconditional `memories_au` FTS trigger, which
         // deletes and re-inserts the row's FTS entry. Harmless -- `content` is
         // unchanged, so the entry is rewritten identically -- and narrowing the
         // trigger would mean changing shipped schema DDL for no behavioural
         // gain.
+        let at = truncate_for_storage(at);
         let conn = self.conn.lock().unwrap();
         let changed = conn
             .execute(
