@@ -178,6 +178,67 @@ fn handshake_then_add_then_search_over_real_stdio() {
         "add_memory's kind enum no longer lists exactly the five expected values, in order: {kind_schema}"
     );
 
+    // The supersession parameters must reach the wire schema with their
+    // formats intact: `format: "uuid"` and `format: "date-time"` tell a model
+    // what shape to send far better than a bare string would, and enabling
+    // schemars' `uuid1`/`chrono04` features is the only reason they are there.
+    let supersedes_schema = &input_schema["properties"]["supersedes"];
+    assert_eq!(
+        supersedes_schema["format"].as_str(),
+        Some("uuid"),
+        "add_memory's supersedes must be documented as a uuid: {supersedes_schema}"
+    );
+    // rmcp normalizes schemars' `"type": ["string", "null"]` union into the
+    // draft-07 spelling `"type": "string", "nullable": true` before putting it
+    // on the wire, so assert the shape a client actually receives -- the same
+    // one the pre-existing optional `project` field already has.
+    assert_eq!(
+        supersedes_schema["type"].as_str(),
+        Some("string"),
+        "supersedes must be a string: {supersedes_schema}"
+    );
+    assert_eq!(
+        supersedes_schema["nullable"].as_bool(),
+        Some(true),
+        "supersedes must be nullable: {supersedes_schema}"
+    );
+    assert!(
+        !input_schema["required"]
+            .as_array()
+            .expect("required must be an array")
+            .iter()
+            .any(|v| v == "supersedes"),
+        "supersedes must stay optional: an ordinary new memory replaces nothing"
+    );
+
+    let search_tool = tools
+        .iter()
+        .find(|t| t["name"] == "search_memory")
+        .expect("search_memory tool must be listed");
+    let search_schema = &search_tool["inputSchema"];
+    println!(
+        "search_memory inputSchema:\n{}",
+        serde_json::to_string_pretty(search_schema).unwrap()
+    );
+
+    let as_of_schema = &search_schema["properties"]["as_of"];
+    assert_eq!(
+        as_of_schema["format"].as_str(),
+        Some("date-time"),
+        "search_memory's as_of must be documented as an RFC3339 instant: {as_of_schema}"
+    );
+    let include_superseded_schema = &search_schema["properties"]["include_superseded"];
+    assert_eq!(
+        include_superseded_schema["type"].as_str(),
+        Some("boolean"),
+        "include_superseded must be a boolean: {include_superseded_schema}"
+    );
+    assert_eq!(
+        include_superseded_schema["nullable"].as_bool(),
+        Some(true),
+        "include_superseded must be nullable: {include_superseded_schema}"
+    );
+
     // An invalid kind now fails during rmcp's own JSON deserialization,
     // before the tool handler runs -- that's a protocol-level error
     // (JSON-RPC `error`, not a successful `result` carrying a tool error).
@@ -222,6 +283,124 @@ fn handshake_then_add_then_search_over_real_stdio() {
     );
     let text = serde_json::to_string(&found["result"]).unwrap();
     assert!(text.contains("spawns the real binary"), "search returned: {text}");
+
+    // Supersede it, over the real wire, and confirm search now returns only the
+    // replacement while `get` still answers for the old id.
+    let old_id = {
+        let text = serde_json::to_string(&added["result"]).unwrap();
+        // The tool reports "Stored fact memory in 'e2e'. id: <uuid>". Take
+        // everything after the marker that could belong to a uuid, so the
+        // surrounding JSON quoting and escapes stop the scan naturally.
+        let marker = "id: ";
+        let start = text.rfind(marker).expect("add_memory reports the new id") + marker.len();
+        text[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+            .collect::<String>()
+    };
+    assert_eq!(
+        old_id.len(),
+        36,
+        "expected a uuid from add_memory's reply, got '{old_id}'"
+    );
+
+    let superseded = server.request(
+        "tools/call",
+        serde_json::json!({
+            "name": "add_memory",
+            "arguments": {
+                "content": "The e2e test now speaks supersession too.",
+                "kind": "fact",
+                "project": "e2e",
+                "supersedes": old_id
+            }
+        }),
+    );
+    assert!(
+        superseded.get("result").is_some(),
+        "supersede failed: {superseded}"
+    );
+    assert!(
+        !superseded["result"]["isError"].as_bool().unwrap_or(false),
+        "supersede reported a tool error: {superseded}"
+    );
+
+    let live = server.request(
+        "tools/call",
+        serde_json::json!({
+            "name": "search_memory",
+            "arguments": { "query": "e2e test", "project": "e2e" }
+        }),
+    );
+    let live_text = serde_json::to_string(&live["result"]).unwrap();
+    assert!(
+        live_text.contains("speaks supersession"),
+        "search returned: {live_text}"
+    );
+    assert!(
+        !live_text.contains("spawns the real binary"),
+        "the superseded fact must drop out of search: {live_text}"
+    );
+
+    // Superseded, not deleted.
+    let by_id = server.request(
+        "tools/call",
+        serde_json::json!({ "name": "get_memory", "arguments": { "id": old_id } }),
+    );
+    let by_id_text = serde_json::to_string(&by_id["result"]).unwrap();
+    assert!(
+        by_id_text.contains("spawns the real binary"),
+        "the superseded memory must stay retrievable by id: {by_id_text}"
+    );
+
+    // include_superseded brings it back.
+    let history = server.request(
+        "tools/call",
+        serde_json::json!({
+            "name": "search_memory",
+            "arguments": { "query": "e2e test", "project": "e2e", "include_superseded": true }
+        }),
+    );
+    let history_text = serde_json::to_string(&history["result"]).unwrap();
+    assert!(
+        history_text.contains("spawns the real binary")
+            && history_text.contains("speaks supersession"),
+        "include_superseded must show the whole history: {history_text}"
+    );
+
+    // The contradictory combination must come back as a *tool* error carrying
+    // the explanation, not a protocol failure and not an empty result: an agent
+    // has to be able to read why and fix its call.
+    let contradiction = server.request(
+        "tools/call",
+        serde_json::json!({
+            "name": "search_memory",
+            "arguments": {
+                "query": "e2e",
+                "project": "e2e",
+                "include_superseded": true,
+                "as_of": "2026-01-01T00:00:00Z"
+            }
+        }),
+    );
+    println!(
+        "as_of + include_superseded response:\n{}",
+        serde_json::to_string_pretty(&contradiction).unwrap()
+    );
+    assert!(
+        contradiction.get("result").is_some(),
+        "the rejection should be a tool error, not a protocol error: {contradiction}"
+    );
+    assert_eq!(
+        contradiction["result"]["isError"].as_bool(),
+        Some(true),
+        "the rejection must be flagged as a tool error: {contradiction}"
+    );
+    let reason = serde_json::to_string(&contradiction["result"]["content"]).unwrap();
+    assert!(
+        reason.contains("as_of") && reason.contains("include_superseded"),
+        "the message must name both fields so the agent can fix its call: {reason}"
+    );
 
     // Clean up: drop the server first so the child process (and its open
     // SQLite handle) is gone before we try to remove the temp directory --

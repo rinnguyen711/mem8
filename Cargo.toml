@@ -30,7 +30,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = "1"
+# `uuid1` and `chrono04` add `JsonSchema` for `Uuid` and `DateTime<Utc>`, which
+# schemars does not implement by default. The MCP tool parameters use both, and
+# taking them as bare `String` would emit an untyped string to the agent instead
+# of `format: "uuid"` / `format: "date-time"` — the schema is the only
+# documentation an agent reads, so the shape has to be in it.
+schemars = { version = "1", features = ["uuid1", "chrono04"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }

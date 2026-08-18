@@ -2,6 +2,7 @@ use crate::core::{Memory8, SearchOptions};
 #[allow(unused_imports)]
 use crate::error::Mem8Error;
 use crate::model::{Kind, SearchHit};
+use chrono::{DateTime, Utc};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -22,6 +23,19 @@ pub struct AddMemoryParams {
     /// directory. Required when mem8 is served over HTTP, because the server
     /// cannot infer which project a remote caller means.
     pub project: Option<String>,
+    /// The id of a memory this one replaces, when the project has changed its
+    /// mind.
+    ///
+    /// Pass this when the new memory contradicts an existing one you just found
+    /// by searching — the old fact stops being returned by search but stays
+    /// retrievable by id, so past decisions remain explicable. Leave it unset
+    /// when the memory is simply new information.
+    ///
+    /// Use the `id` shown for a hit in `search_memory` results.
+    ///
+    /// The target must be in the same project and must not already be
+    /// superseded.
+    pub supersedes: Option<Uuid>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -45,6 +59,18 @@ pub struct SearchMemoryParams {
     pub global: Option<bool>,
     /// Maximum results; defaults to 10, capped at 50.
     pub limit: Option<usize>,
+    /// Include memories that have been replaced by newer ones.
+    ///
+    /// Defaults to false, which returns only what is currently true. Set it to
+    /// see the full history of a changed decision: superseded entries are marked
+    /// with the date they stopped being true, so do not quote one as current.
+    /// Cannot be combined with `as_of`.
+    pub include_superseded: Option<bool>,
+    /// Answer as of a past instant, RFC3339 — what was believed then.
+    ///
+    /// Returns memories created at or before this time that had not yet been
+    /// replaced as of it. Cannot be combined with `include_superseded`.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -94,12 +120,27 @@ fn render_hits(hits: &[SearchHit]) -> String {
     }
     hits.iter()
         .map(|h| {
+            // A superseded memory must never read as current. `include_superseded`
+            // exists so an agent can see the history of a changed decision, which
+            // only works if the retracted entries are distinguishable from the
+            // live one.
+            //
+            // Keyed on `invalid_at` rather than `superseded_by`, matching what
+            // search filters on: a memory can be dead with an unknown successor,
+            // and that is still not current. Appended only when the memory is
+            // actually dead, so an ordinary search renders byte-identically to
+            // before this existed and pays no tokens for the feature.
+            let superseded = match h.memory.invalid_at {
+                Some(at) => format!("  superseded: {}", at.format("%Y-%m-%d")),
+                None => String::new(),
+            };
+
             // Results already arrive best-first, but without the score every hit
             // reads as equally relevant, so a vague query looks the same as an
             // exact one. Showing it lets the caller tell a strong match from the
             // long tail below it.
             format!(
-                "[{}] ({}, score {:.3}) {}\n  id: {}  project: {}  tags: {}",
+                "[{}] ({}, score {:.3}) {}\n  id: {}  project: {}  tags: {}{}",
                 h.memory.created_at.format("%Y-%m-%d"),
                 h.memory.kind,
                 h.score,
@@ -110,7 +151,8 @@ fn render_hits(hits: &[SearchHit]) -> String {
                     "-".into()
                 } else {
                     h.memory.tags.join(", ")
-                }
+                },
+                superseded
             )
         })
         .collect::<Vec<_>>()
@@ -144,13 +186,12 @@ impl Mem8Server {
         Ok(
             match self
                 .service
-                // Task 9 wires this to a real `supersedes` parameter.
                 .add(
                     &p.content,
                     p.kind,
                     p.tags.unwrap_or_default(),
                     p.project,
-                    None,
+                    p.supersedes,
                 )
                 .await
             {
@@ -181,7 +222,8 @@ impl Mem8Server {
                         kind: p.kind,
                         tags: p.tags.unwrap_or_default(),
                         limit: p.limit,
-                        ..Default::default()
+                        include_superseded: p.include_superseded.unwrap_or(false),
+                        as_of: p.as_of,
                     },
                 )
                 .await
@@ -304,7 +346,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemStore;
+    use crate::store::{MemStore, Store};
     use std::sync::Arc;
 
     fn server() -> Mem8Server {
@@ -319,6 +361,7 @@ mod tests {
             kind: Kind::Decision,
             tags: None,
             project: Some("p1".into()),
+            supersedes: None,
         }))
         .await
         .expect("protocol-level call must not fail");
@@ -331,6 +374,8 @@ mod tests {
                 project: Some("p1".into()),
                 global: None,
                 limit: None,
+                include_superseded: None,
+                as_of: None,
             }))
             .await
             .expect("protocol-level call must not fail");
@@ -395,5 +440,380 @@ mod tests {
             .expect("protocol-level call must not fail");
         assert!(result.is_error.unwrap_or(false));
         assert!(result_text(&result).contains("not found"));
+    }
+
+    /// The whole point of `supersedes` on the tool surface: an agent that
+    /// records a changed decision sees only the current one when it searches
+    /// again.
+    #[tokio::test]
+    async fn add_memory_accepts_supersedes_and_hides_the_old_fact() {
+        let s = server();
+
+        let old = s
+            .service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .expect("the first memory must store");
+
+        let added = s
+            .add_memory(Parameters(AddMemoryParams {
+                content: "storage is postgres".into(),
+                kind: Kind::Decision,
+                tags: None,
+                project: Some("p1".into()),
+                supersedes: Some(old.id),
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+        assert!(
+            !added.is_error.unwrap_or(false),
+            "supersede should succeed, got: {}",
+            result_text(&added)
+        );
+
+        let result = s
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "storage".into(),
+                kind: None,
+                tags: None,
+                project: Some("p1".into()),
+                global: None,
+                limit: None,
+                include_superseded: None,
+                as_of: None,
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+
+        let text = result_text(&result);
+        assert!(text.contains("storage is postgres"), "got: {text}");
+        assert!(
+            !text.contains("storage is sqlite"),
+            "only the live fact should be returned, got: {text}"
+        );
+
+        // Superseded, not deleted: `get` still answers, which is what keeps a
+        // past decision explicable.
+        let fetched = s
+            .get_memory(Parameters(IdParams {
+                id: old.id.to_string(),
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+        assert!(
+            result_text(&fetched).contains("storage is sqlite"),
+            "the superseded memory must stay retrievable by id"
+        );
+    }
+
+    /// `include_superseded` reaches the search options rather than being
+    /// dropped on the way through.
+    #[tokio::test]
+    async fn include_superseded_returns_the_replaced_fact() {
+        let s = server();
+
+        let old = s
+            .service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        s.service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap();
+
+        let result = s
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "storage".into(),
+                kind: None,
+                tags: None,
+                project: Some("p1".into()),
+                global: None,
+                limit: None,
+                include_superseded: Some(true),
+                as_of: None,
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+
+        let text = result_text(&result);
+        assert!(text.contains("storage is sqlite"), "got: {text}");
+        assert!(text.contains("storage is postgres"), "got: {text}");
+    }
+
+    /// `as_of` reaches the search options too: at an instant inside the old
+    /// memory's validity window, the old fact is what was believed.
+    #[tokio::test]
+    async fn as_of_answers_what_was_believed_then() {
+        let store = Arc::new(MemStore::new());
+        let s = Mem8Server::new(Arc::new(Memory8::new(store.clone())));
+
+        let old = s
+            .service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let new = s
+            .service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap();
+
+        // Invalidate again through the store with an explicit instant rather
+        // than probing the window `add` produced. Two wall-clock samples
+        // microseconds apart leave a window narrower than any round offset can
+        // land inside -- `created_at` is stored raw while `invalid_at` is
+        // truncated to microseconds -- so `core`'s own `as_of` test widens the
+        // window by construction for the same reason. `supersede` is
+        // write-once, so re-invalidating the already-dead `old` is refused;
+        // invalidate `new` instead and probe inside *its* window.
+        let at = new.created_at + chrono::Duration::seconds(10);
+        store.supersede(new.id, None, at).await.unwrap();
+        let invalidated = s.service.get(new.id).await.unwrap().invalid_at.unwrap();
+
+        let result = s
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "postgres".into(),
+                kind: None,
+                tags: None,
+                project: Some("p1".into()),
+                global: None,
+                limit: None,
+                include_superseded: None,
+                as_of: Some(invalidated - chrono::Duration::seconds(1)),
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+        assert!(
+            result_text(&result).contains("storage is postgres"),
+            "as_of inside the validity window must return the fact believed then, got: {}",
+            result_text(&result)
+        );
+
+        // And at the invalidation instant it is gone: the predicate is
+        // `invalid_at > T`, so T == invalid_at excludes it. This is what proves
+        // `as_of` is actually reaching the store rather than being ignored.
+        let after = s
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "postgres".into(),
+                kind: None,
+                tags: None,
+                project: Some("p1".into()),
+                global: None,
+                limit: None,
+                include_superseded: None,
+                as_of: Some(invalidated),
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+        assert!(
+            !result_text(&after).contains("storage is postgres"),
+            "at the invalidation instant the fact is already dead, got: {}",
+            result_text(&after)
+        );
+    }
+
+    /// A retracted decision must not read as authoritative. Without a marker,
+    /// `include_superseded` hands the agent a flat list in which the dead fact
+    /// and the live one look identical, and the agent can quote either.
+    #[tokio::test]
+    async fn a_superseded_hit_is_marked_and_a_live_one_is_not() {
+        let s = server();
+
+        let old = s
+            .service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        s.service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap();
+
+        let result = s
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "storage".into(),
+                kind: None,
+                tags: None,
+                project: Some("p1".into()),
+                global: None,
+                limit: None,
+                include_superseded: Some(true),
+                as_of: None,
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+        let text = result_text(&result);
+
+        // Both are present, but only the dead one carries the marker. Assert per
+        // line rather than on the whole blob: a marker anywhere would otherwise
+        // satisfy a naive `contains`, including one wrongly attached to the live
+        // fact.
+        let dead_line = text
+            .lines()
+            .find(|l| l.contains(&old.id.to_string()))
+            .unwrap_or_else(|| panic!("the superseded memory must be listed: {text}"));
+        assert!(
+            dead_line.contains("superseded:"),
+            "a superseded hit must be marked so it cannot be quoted as current: {dead_line}"
+        );
+        // The invalidation date, so the agent can tell *when* it stopped being
+        // true rather than only that it did.
+        let invalid_at = s.service.get(old.id).await.unwrap().invalid_at.unwrap();
+        assert!(
+            dead_line.contains(&invalid_at.format("%Y-%m-%d").to_string()),
+            "the marker must carry the date it stopped being true: {dead_line}"
+        );
+
+        // A hit spans two lines -- content, then metadata -- and the marker
+        // lives on the second, so check the live memory's whole entry.
+        let live_entry = text
+            .split("\n\n")
+            .find(|e| e.contains("storage is postgres"))
+            .unwrap_or_else(|| panic!("the live memory must be listed: {text}"));
+        assert!(
+            !live_entry.contains("superseded:"),
+            "the current fact must not be marked: {live_entry}"
+        );
+    }
+
+    /// An ordinary search renders exactly as it did before supersession
+    /// existed: the marker costs nothing when nothing is dead.
+    #[tokio::test]
+    async fn a_live_only_search_renders_without_any_marker() {
+        let s = server();
+        s.service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = s
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "storage".into(),
+                kind: None,
+                tags: None,
+                project: Some("p1".into()),
+                global: None,
+                limit: None,
+                include_superseded: None,
+                as_of: None,
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+        let text = result_text(&result);
+        assert!(text.contains("storage is postgres"), "got: {text}");
+        assert!(
+            !text.contains("superseded"),
+            "a live hit must render exactly as before: {text}"
+        );
+    }
+
+    /// An agent that sets both must be told why, in the tool result rather
+    /// than as an opaque protocol failure.
+    #[tokio::test]
+    async fn search_rejects_as_of_with_include_superseded() {
+        let s = server();
+        let result = s
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "x".into(),
+                kind: None,
+                tags: None,
+                project: Some("p1".into()),
+                global: None,
+                limit: None,
+                include_superseded: Some(true),
+                as_of: Some(chrono::Utc::now()),
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+
+        assert!(
+            result.is_error.unwrap_or(false),
+            "the contradiction must surface as a tool error"
+        );
+        let text = result_text(&result);
+        assert!(text.contains("as_of"), "got: {text}");
+        assert!(text.contains("include_superseded"), "got: {text}");
+    }
+
+    /// Superseding a memory in another project is refused, and the refusal
+    /// reaches the caller as readable text rather than a bare failure.
+    #[tokio::test]
+    async fn supersede_across_projects_is_a_readable_tool_error() {
+        let s = server();
+        let elsewhere = s
+            .service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p2".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = s
+            .add_memory(Parameters(AddMemoryParams {
+                content: "storage is postgres".into(),
+                kind: Kind::Decision,
+                tags: None,
+                project: Some("p1".into()),
+                supersedes: Some(elsewhere.id),
+            }))
+            .await
+            .expect("protocol-level call must not fail");
+
+        assert!(result.is_error.unwrap_or(false));
+        let text = result_text(&result);
+        assert!(text.contains("p2") && text.contains("p1"), "got: {text}");
     }
 }
