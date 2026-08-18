@@ -1807,6 +1807,9 @@ Expected: FAIL — nothing imports as superseded, because `import` drops the fie
 
 - [ ] **Step 3: Implement the remapping pass**
 
+**Pass 2 must not abort on the first failure.** Nothing spans the two passes transactionally, so an early `?` return leaves the already-processed memories invalidated and the remaining dead ones LIVE — and because `supersede` is write-once and import always creates fresh rows, re-running does not repair them. That resurrected fact is permanent, which is strictly worse than the guarantee `core::add` makes, where the leftover state is explicitly repairable by the next write. Attempt every invalidation, collect the failures, and return an error naming them, so the damage stays visible and bounded rather than silent and permanent. Found by fault injection during review of the first implementation.
+
+
 Rewrite the body of `import` after parsing:
 
 ```rust
