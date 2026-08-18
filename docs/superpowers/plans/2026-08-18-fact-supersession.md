@@ -942,7 +942,19 @@ MEM8_TEST_PG=1 cargo test --test store_contract 2>&1 | tail -10
 ```
 Expected: PASS both. The contract suite now proves SQLite and Postgres agree on supersession semantics.
 
-- [ ] **Step 6: Remove the interim stub deliberately**
+- [ ] **Step 6: Flip the contract capability flag**
+
+Task 5 added a `Supports { supersede: bool }` parameter to `run_contract` in `tests/store_contract.rs`, because the shared contract runs against both backends and Postgres could not yet supersede. Postgres's call site currently passes `supersede: false`.
+
+**Flip it to `true`.** This is not optional bookkeeping — it is what makes the contract suite actually verify that SQLite and Postgres agree on supersession semantics, which is the entire reason the suite exists. Find it with:
+
+```bash
+grep -n "supersede: false" tests/store_contract.rs
+```
+
+Then run the contract suite against Postgres and confirm every supersession and `as_of` assertion now executes there. If any fails, the Postgres predicate disagrees with SQLite's — fix Postgres, not the assertion.
+
+- [ ] **Step 7: Remove the interim stub deliberately**
 
 Tasks 3-4 left `PgStore::supersede` returning `Mem8Error::Unsupported` so the tree would compile. Confirm you have replaced it with the real implementation and that no `Unsupported` stub remains:
 
@@ -952,10 +964,10 @@ grep -n "Unsupported" src/store/postgres.rs
 
 Any hit inside `supersede` means the real implementation did not land. The contract suite in Task 5 already exercises `supersede` against whichever backend it runs, so a forgotten stub fails there rather than reaching a user — but check explicitly, because the stub errors rather than panics and is easy to miss.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/store/postgres.rs tests/pg_migration.rs
+git add src/store/postgres.rs tests/pg_migration.rs tests/store_contract.rs
 git commit -m "feat(postgres): migrate to schema 3 with supersession columns"
 ```
 
