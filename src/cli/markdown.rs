@@ -161,6 +161,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             embedding: None,
+            superseded_by: None,
+            invalid_at: None,
         }
     }
 

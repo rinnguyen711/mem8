@@ -66,6 +66,23 @@ pub struct Memory {
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// The memory that replaced this one, if its successor is known.
+    ///
+    /// Written only alongside `invalid_at`: a successor with no invalidation
+    /// time is incoherent and must never be stored. The converse is legitimate
+    /// — `invalid_at` set with `superseded_by` NULL means the memory is known
+    /// dead but its replacement is unknown, which import produces when a file
+    /// names a successor it does not contain.
+    ///
+    /// The invariant is enforced in the store layer rather than by a database
+    /// constraint, so both backends behave identically and the rule lives next
+    /// to the code that applies it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Uuid>,
+    /// When this memory stopped being true. `None` means it is still live, and
+    /// search will filter on this field alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +161,59 @@ pub struct SearchHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn live_memory_omits_supersession_fields_from_json() {
+        let now = Utc::now();
+        let m = Memory {
+            id: Uuid::new_v4(),
+            project: "p".into(),
+            kind: Kind::Decision,
+            content: "invalid_at and superseded_by appear in this content".into(),
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            superseded_by: None,
+            invalid_at: None,
+        };
+
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("superseded_by"),
+            "a live memory must serialize exactly as before, got: {v}"
+        );
+        assert!(!obj.contains_key("invalid_at"), "got: {v}");
+    }
+
+    #[test]
+    fn superseded_memory_includes_both_fields_in_json() {
+        let now = Utc::now();
+        let successor = Uuid::new_v4();
+        let m = Memory {
+            id: Uuid::new_v4(),
+            project: "p".into(),
+            kind: Kind::Decision,
+            content: "c".into(),
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            superseded_by: Some(successor),
+            invalid_at: Some(now),
+        };
+
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj["superseded_by"],
+            serde_json::json!(successor.to_string()),
+            "got: {v}"
+        );
+        assert!(obj.contains_key("invalid_at"), "got: {v}");
+    }
 
     #[test]
     fn kind_parses_from_lowercase() {

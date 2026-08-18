@@ -259,6 +259,8 @@ fn row_to_memory(row: &PgRow) -> Result<Memory> {
         created_at: row.get::<DateTime<Utc>, _>("created_at"),
         updated_at: row.get::<DateTime<Utc>, _>("updated_at"),
         embedding: None,
+        superseded_by: None,
+        invalid_at: None,
     })
 }
 

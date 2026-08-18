@@ -85,6 +85,8 @@ impl Store for MemStore {
             created_at: now,
             updated_at: now,
             embedding: new.embedding,
+            superseded_by: None,
+            invalid_at: None,
         };
         self.rows.lock().unwrap().push(memory.clone());
         Ok(memory)

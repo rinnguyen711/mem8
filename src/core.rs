@@ -1007,6 +1007,8 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 embedding: None,
+                superseded_by: None,
+                invalid_at: None,
             },
             score,
         }

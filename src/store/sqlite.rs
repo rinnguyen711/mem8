@@ -134,6 +134,8 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
         created_at,
         updated_at,
         embedding: None,
+        superseded_by: None,
+        invalid_at: None,
     })
 }
 
@@ -150,6 +152,8 @@ impl Store for SqliteStore {
             created_at: now,
             updated_at: now,
             embedding: None,
+            superseded_by: None,
+            invalid_at: None,
         };
 
         let tags = serde_json::to_string(&memory.tags).map_err(store_err)?;
