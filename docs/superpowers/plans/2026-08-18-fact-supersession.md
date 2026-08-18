@@ -1508,7 +1508,22 @@ To `SearchMemoryParams`:
     pub as_of: Option<DateTime<Utc>>,
 ```
 
-`Uuid` and `DateTime<Utc>` both need to satisfy `schemars::JsonSchema` for the derive to work. `uuid` needs its `schemars` support and `chrono` likewise — check `Cargo.toml`. If a feature is missing, either enable it, or take these as `String` at the boundary and parse with a named error:
+`Uuid` and `DateTime<Utc>` both need to satisfy `schemars::JsonSchema` for the derive to work, and **neither does by default** — verified by probe: `the trait \`JsonSchema\` is not implemented for \`Uuid\`` and likewise for `DateTime<Utc>`.
+
+**Enable the schemars features rather than taking these as `String`.** Change `Cargo.toml` to:
+
+```toml
+schemars = { version = "1", features = ["uuid1", "chrono04"] }
+```
+
+That compiles, and generates exactly the schema an agent should see — verified by probe:
+
+```json
+"supersedes": { "type": ["string", "null"], "format": "uuid" },
+"as_of":      { "type": ["string", "null"], "format": "date-time" }
+```
+
+`format: "uuid"` and `format: "date-time"` tell the model what shape to send far better than a bare string would, so this is the preferred route. The `String`-and-parse fallback below is recorded only in case the features are unavailable for some reason:
 
 ```rust
     let as_of = match params.as_of.as_deref() {
