@@ -562,6 +562,8 @@ Add to `trait Store` in `src/store/mod.rs`:
     async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()>;
 ```
 
+**Both backends truncate `at` to microsecond precision before storing.** Postgres's `TIMESTAMPTZ` holds only microseconds while SQLite's RFC3339 text holds nanoseconds, so an untruncated instant makes the two disagree about an `as_of` that falls between the truncated and the full value — measured as 1 hit on SQLite versus 0 on Postgres. Dormant on macOS, where `Utc::now()` is already microsecond-resolution; live on Linux, where it is not. Callers pass whatever instant they have and the store normalises, so no caller — including Task 7's write path and Task 11's import — needs to know.
+
 Add `use chrono::{DateTime, Utc};` to the imports (the file currently imports only `Utc`).
 
 Implement for `MemStore`:
