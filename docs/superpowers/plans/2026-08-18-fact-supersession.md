@@ -890,6 +890,9 @@ This sits inside the same advisory lock and the same transaction that already se
 
 - [ ] **Step 4: Read, write, and filter the columns**
 
+**Do not add the temporal predicate to `missing_embeddings`.** Backfill is not a search: a superseded memory with no embedding must still be backfillable, or `mem8 reindex` skips it forever. SQLite cannot hold embeddings at all so this is moot there, but Postgres's `missing_embeddings` is live code and its bare `WHERE embedding IS NULL` must stay bare.
+
+
 Add both fields to the row-mapping code (`superseded_by` maps to `Option<Uuid>`, `invalid_at` to `Option<DateTime<Utc>>` — both native sqlx types, so no parsing). Ensure every `SELECT` lists them.
 
 Implement `supersede`:
@@ -929,7 +932,11 @@ Add the same three-mode predicate to `search` and `vector_search`, using `$n` pl
 
 Bind the `as_of` timestamp once and reference it twice, or bind it twice — follow whichever the surrounding code makes natural. `vector_search` needs it too: a semantic search that ignored supersession would surface dead facts that keyword search correctly hides.
 
-**Two divergence traps, both confirmed by review of Tasks 3-4:**
+**Four divergence traps, confirmed by review of Tasks 3-5:**
+
+- **`LIMIT` is already inside the Postgres SQL, unlike SQLite's.** SQLite deliberately keeps `LIMIT` out of its query and truncates in Rust after tag filtering; Postgres pushes both `tags @> $n` and `LIMIT $n` into SQL. So the temporal predicate must go in the same `WHERE`, *before* the `LIMIT`. Adding it as a Rust post-filter — mirroring SQLite's tag-filter structure — would truncate to `limit` before hiding superseded rows, returning fewer than `limit` live hits whenever superseded rows occupy slots. The existing `embedding IS NOT NULL` comment in `postgres.rs` warns about the same shape for NULLs, so the precedent for getting this wrong is already in the file.
+- **`TIMESTAMPTZ` holds only microseconds; SQLite's RFC3339 text holds nanoseconds.** `postgres.rs` already documents this for `created_at`. For `as_of` comparisons where `invalid_at` and `T` differ by less than a microsecond, Postgres compares both values rounded while SQLite compares full nanoseconds, so `>` behaves as `>=` in that window and near-boundary results diverge. Equal-is-equal, so the exactly-at contract assertion passes on both. Keep contract assertions at millisecond-or-coarser offsets rather than microsecond ones.
+
 
 - **Use `TIMESTAMPTZ` for `invalid_at`, not TEXT.** SQLite stores it as RFC3339 text because that is what its other timestamps are; Postgres's `created_at`/`updated_at` are already `TIMESTAMPTZ`. Matching SQLite's TEXT here would give Postgres a text-comparison fragility it has no reason to carry. Both are temporally correct, so results still agree.
 - **The predicate must go in the same SQL statement as the `LIMIT`.** Postgres applies `LIMIT` in SQL, so adding the temporal filter as a post-filter in Rust would truncate before filtering and diverge from both `MemStore` and SQLite, which filter before `.take(limit)`.
