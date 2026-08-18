@@ -74,6 +74,29 @@ pub struct NewMemory {
     pub kind: Kind,
     pub content: String,
     pub tags: Vec<String>,
+    /// Set when semantic search is enabled and the embedder was available.
+    ///
+    /// `None` means the memory is findable by keyword only. Storing it that way
+    /// is deliberate: an embedding failure must not cost the user the write.
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// Hand-written rather than derived, because deriving it would require
+/// `Kind: Default`, and a `#[default]` variant changes the JSON schema
+/// generated for the MCP tool surface: schemars emits the defaulted variant as
+/// a separate `const` branch inside a `oneOf` instead of one flat `enum`.
+/// Agents read that schema, so the wire contract must not shift to make a test
+/// constructor shorter.
+impl Default for NewMemory {
+    fn default() -> Self {
+        Self {
+            project: String::new(),
+            kind: Kind::Decision,
+            content: String::new(),
+            tags: Vec::new(),
+            embedding: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,11 +104,30 @@ pub struct MemoryUpdate {
     pub content: Option<String>,
     pub kind: Option<Kind>,
     pub tags: Option<Vec<String>>,
+    /// A replacement embedding, when the content changed and could be
+    /// re-embedded. `None` leaves the stored vector untouched.
+    pub embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub text: String,
+    pub project: Option<String>,
+    pub global: bool,
+    pub kind: Option<Kind>,
+    pub tags: Vec<String>,
+    pub limit: usize,
+}
+
+/// A search by embedding similarity rather than by words.
+///
+/// Mirrors `SearchQuery` field for field apart from carrying a vector instead
+/// of text. The filters are not optional extras: a semantic search that ignored
+/// `project` would surface one project's memories in another, which is exactly
+/// what scoping exists to prevent.
+#[derive(Debug, Clone)]
+pub struct VectorQuery {
+    pub embedding: Vec<f32>,
     pub project: Option<String>,
     pub global: bool,
     pub kind: Option<Kind>,

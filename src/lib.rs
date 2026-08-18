@@ -1,6 +1,8 @@
 pub mod cli;
 pub mod core;
+pub mod embed;
 pub mod error;
+pub mod http;
 pub mod mcp;
 pub mod model;
 pub mod scope;

@@ -16,7 +16,11 @@ pub struct AddMemoryParams {
     pub kind: Kind,
     /// Optional labels for filtering later.
     pub tags: Option<Vec<String>>,
-    /// Overrides the auto-detected project scope.
+    /// The project this memory belongs to.
+    ///
+    /// Optional when mem8 runs locally, where it is detected from the working
+    /// directory. Required when mem8 is served over HTTP, because the server
+    /// cannot infer which project a remote caller means.
     pub project: Option<String>,
 }
 
@@ -31,7 +35,11 @@ pub struct SearchMemoryParams {
     pub kind: Option<Kind>,
     /// Only return memories carrying all of these tags.
     pub tags: Option<Vec<String>>,
-    /// Overrides the auto-detected project scope.
+    /// The project to search.
+    ///
+    /// Optional when mem8 runs locally, where it is detected from the working
+    /// directory. Required when mem8 is served over HTTP, unless `global` is
+    /// true.
     pub project: Option<String>,
     /// Search every project instead of the current one; overrides `project` when true.
     pub global: Option<bool>,
@@ -98,7 +106,11 @@ fn render_hits(hits: &[SearchHit]) -> String {
                 h.memory.content,
                 h.memory.id,
                 h.memory.project,
-                if h.memory.tags.is_empty() { "-".into() } else { h.memory.tags.join(", ") }
+                if h.memory.tags.is_empty() {
+                    "-".into()
+                } else {
+                    h.memory.tags.join(", ")
+                }
             )
         })
         .collect::<Vec<_>>()
@@ -113,7 +125,10 @@ pub struct Mem8Server {
 
 impl Mem8Server {
     pub fn new(service: Arc<Memory8>) -> Self {
-        Self { service, tool_router: Self::tool_router() }
+        Self {
+            service,
+            tool_router: Self::tool_router(),
+        }
     }
 }
 
@@ -126,14 +141,19 @@ impl Mem8Server {
         &self,
         Parameters(p): Parameters<AddMemoryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(match self
-            .service
-            .add(&p.content, p.kind, p.tags.unwrap_or_default(), p.project)
-            .await
-        {
-            Ok(m) => ok(format!("Stored {} memory in '{}'. id: {}", m.kind, m.project, m.id)),
-            Err(e) => fail(e.to_string()),
-        })
+        Ok(
+            match self
+                .service
+                .add(&p.content, p.kind, p.tags.unwrap_or_default(), p.project)
+                .await
+            {
+                Ok(m) => ok(format!(
+                    "Stored {} memory in '{}'. id: {}",
+                    m.kind, m.project, m.id
+                )),
+                Err(e) => fail(e.to_string()),
+            },
+        )
     }
 
     #[tool(
@@ -143,21 +163,23 @@ impl Mem8Server {
         &self,
         Parameters(p): Parameters<SearchMemoryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(match self
-            .service
-            .search(
-                &p.query,
-                p.project,
-                p.global.unwrap_or(false),
-                p.kind,
-                p.tags.unwrap_or_default(),
-                p.limit,
-            )
-            .await
-        {
-            Ok(hits) => ok(render_hits(&hits)),
-            Err(e) => fail(e.to_string()),
-        })
+        Ok(
+            match self
+                .service
+                .search(
+                    &p.query,
+                    p.project,
+                    p.global.unwrap_or(false),
+                    p.kind,
+                    p.tags.unwrap_or_default(),
+                    p.limit,
+                )
+                .await
+            {
+                Ok(hits) => ok(render_hits(&hits)),
+                Err(e) => fail(e.to_string()),
+            },
+        )
     }
 
     #[tool(description = "Retrieve one memory in full by its id.")]
@@ -177,7 +199,11 @@ impl Mem8Server {
                 m.content,
                 m.id,
                 m.project,
-                if m.tags.is_empty() { "-".into() } else { m.tags.join(", ") },
+                if m.tags.is_empty() {
+                    "-".into()
+                } else {
+                    m.tags.join(", ")
+                },
                 m.created_at.to_rfc3339(),
                 m.updated_at.to_rfc3339()
             )),
@@ -196,10 +222,12 @@ impl Mem8Server {
             Ok(i) => i,
             Err(e) => return Ok(e),
         };
-        Ok(match self.service.update(id, p.content, p.kind, p.tags).await {
-            Ok(m) => ok(format!("Updated memory {}.", m.id)),
-            Err(e) => fail(e.to_string()),
-        })
+        Ok(
+            match self.service.update(id, p.content, p.kind, p.tags).await {
+                Ok(m) => ok(format!("Updated memory {}.", m.id)),
+                Err(e) => fail(e.to_string()),
+            },
+        )
     }
 
     #[tool(description = "Permanently delete a memory by its id.")]
@@ -256,8 +284,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     use rmcp::transport::io::stdio;
     use rmcp::ServiceExt;
 
-    let store = crate::store::open_from_env().await?;
-    let server = Mem8Server::new(Arc::new(Memory8::new(store)));
+    let server = Mem8Server::new(Arc::new(crate::cli::build_service().await?));
 
     let running = server.serve(stdio()).await?;
     running.waiting().await?;
@@ -328,7 +355,10 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("banana"), "got: {message}");
         for k in ["decision", "preference", "convention", "fact", "learning"] {
-            assert!(message.contains(k), "expected '{k}' documented in error, got: {message}");
+            assert!(
+                message.contains(k),
+                "expected '{k}' documented in error, got: {message}"
+            );
         }
     }
 
@@ -336,7 +366,9 @@ mod tests {
     async fn get_with_malformed_uuid_is_a_tool_error() {
         let s = server();
         let result = s
-            .get_memory(Parameters(IdParams { id: "not-a-uuid".into() }))
+            .get_memory(Parameters(IdParams {
+                id: "not-a-uuid".into(),
+            }))
             .await
             .expect("protocol-level call must not fail");
         assert!(result.is_error.unwrap_or(false));
@@ -346,7 +378,9 @@ mod tests {
     async fn delete_of_unknown_id_reports_not_found() {
         let s = server();
         let result = s
-            .delete_memory(Parameters(IdParams { id: uuid::Uuid::new_v4().to_string() }))
+            .delete_memory(Parameters(IdParams {
+                id: uuid::Uuid::new_v4().to_string(),
+            }))
             .await
             .expect("protocol-level call must not fail");
         assert!(result.is_error.unwrap_or(false));

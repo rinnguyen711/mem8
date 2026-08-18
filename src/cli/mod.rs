@@ -7,7 +7,39 @@ use std::path::Path;
 use std::sync::Arc;
 
 fn io_err(path: &Path) -> impl Fn(std::io::Error) -> Mem8Error + '_ {
-    move |source| Mem8Error::Io { path: path.display().to_string(), source }
+    move |source| Mem8Error::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+/// Build the service, loading the embedding model when this build has one.
+///
+/// One place, so the MCP server and every CLI subcommand agree on whether
+/// semantic search is available.
+///
+/// A model that fails to load is reported and then ignored: mem8 continues
+/// keyword-only. Refusing to start because an optional index is unavailable
+/// would make the whole memory unreachable over a feature the user may not even
+/// use.
+pub async fn build_service() -> Result<Memory8> {
+    let store = open_from_env().await?;
+
+    #[cfg(feature = "semantic")]
+    {
+        match crate::embed::Embedder::load() {
+            Ok(embedder) => return Ok(Memory8::with_embedder(store, Arc::new(embedder))),
+            Err(e) => eprintln!("mem8: semantic search unavailable, using keyword search: {e}"),
+        }
+    }
+
+    Ok(Memory8::new(store))
+}
+
+/// Backfill embeddings for memories that have none. Returns how many were
+/// embedded.
+pub async fn reindex() -> Result<usize> {
+    build_service().await?.reindex(64).await
 }
 
 /// Write every memory to a markdown file. Returns the number exported.

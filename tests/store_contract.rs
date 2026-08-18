@@ -9,6 +9,7 @@ fn new_memory(project: &str, kind: Kind, content: &str, tags: &[&str]) -> NewMem
         kind,
         content: content.into(),
         tags: tags.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     }
 }
 

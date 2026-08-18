@@ -75,7 +75,7 @@ On Windows the running server holds a lock on `mem8.exe`, so stop it first with
 | Tool | Purpose |
 |---|---|
 | `add_memory` | Store a decision, preference, convention, fact, or learning. |
-| `search_memory` | Keyword search, scoped to the current project by default. |
+| `search_memory` | Search, scoped to the current project by default. Keyword, plus semantic when [enabled](#semantic-search). |
 | `get_memory` | Retrieve one memory in full by id. |
 | `update_memory` | Revise a memory rather than storing a contradictory one. |
 | `delete_memory` | Remove a memory permanently. |
@@ -125,6 +125,122 @@ Both backends satisfy the same contract suite, run against a real server. SQLite
 is the default and has seen far more use, so treat Postgres as the newer of the
 two.
 
+## Semantic search
+
+Off by default. With it on, a question worded differently from the memory still
+finds it — "why did we pick the porter tokenizer" finds a memory recorded as "we
+**chose** the porter tokenizer", which keyword search cannot do.
+
+It needs **Postgres with pgvector**; SQLite stays keyword-only.
+
+```bash
+# 1. Start Postgres with pgvector
+docker compose up -d
+
+# 2. Build with the feature and point mem8 at it
+cargo install --path . --features semantic --force
+export MEM8_DB=postgres://mem8:mem8@localhost:5432/mem8
+
+# 3. Embed the memories you already have
+mem8 reindex
+```
+
+Step 3 matters: memories written before this was enabled have no embedding and
+stay invisible to semantic search until backfilled. `mem8 reindex` is safe to
+re-run — it only touches memories that lack one — and is also what you run after
+`mem8 import`.
+
+Both searches run on every query and their results are merged by rank
+(Reciprocal Rank Fusion). Keyword search is not replaced, because exact
+identifiers — `SqliteStore`, `auth-token`, a commit hash — are what an agent's
+memory is full of and are exactly what embeddings match badly. A memory found by
+both searches ranks above one found by either alone.
+
+What it costs:
+
+- **A bigger binary.** Roughly 10 MB to over 100 MB; fastembed bundles an ONNX
+  runtime.
+- **A one-time download.** ~130 MB for BGE-small-en-v1.5, to `./.fastembed_cache`.
+  Offline after that — no API key, no request leaves your machine.
+- **Slower writes.** Every `add_memory` computes an embedding, tens of
+  milliseconds on CPU.
+
+Degradation is deliberate throughout. If the model fails to load, mem8 runs
+keyword-only and says so. If embedding a particular memory fails, the memory is
+still stored — findable by keyword, and backfillable later by `mem8 reindex`.
+Losing a write because an index was unavailable would be the worse outcome.
+
+On SQLite, or in a build without the feature, everything above is simply absent
+and search behaves exactly as it always has.
+
+## Running mem8 as a shared server
+
+Off by default. The ordinary shape is stdio — the agent runs mem8 as a child
+process and the memory is yours alone, which needs no server, no token, and no
+certificate. This section is for the other shape: one mem8, several clients,
+reached over a network.
+
+```bash
+export MEM8_TOKEN=$(openssl rand -hex 32)
+docker compose --profile server up -d
+
+claude mcp add --transport http mem8 http://127.0.0.1:8080/mcp \
+  --header "Authorization: Bearer $MEM8_TOKEN"
+```
+
+`--profile server` is deliberate: a plain `docker compose up` still starts only
+the database, so running Postgres locally never publishes a server by accident.
+
+### Every call must name its project
+
+Locally, mem8 infers the project from the working directory. A server cannot —
+its working directory is `/app`, the same for every client — so in HTTP mode
+`project` is **required** and a call without it is refused:
+
+```
+'project' is required when mem8 serves over HTTP: the server cannot infer
+which project you mean, because its working directory is its own rather
+than yours.
+```
+
+Refusing is the point. The alternative is filing every client's memories into
+one shared scope, which nothing would report.
+
+`global: true` still works on `search_memory`, since it is explicit about
+crossing projects.
+
+### Authentication and TLS
+
+A bearer token from `MEM8_TOKEN`, compared in constant time. mem8 refuses to
+start over HTTP without one — an unauthenticated memory server is readable by
+anyone who finds the port, so failing to start is the safer default.
+
+TLS is required for any bind that is not loopback:
+
+```bash
+mem8 serve --http 0.0.0.0:8080                             # refuses to start
+mem8 serve --http 0.0.0.0:8080 --tls-cert c.pem --tls-key k.pem   # ok
+mem8 serve --http 127.0.0.1:8080                           # ok, proxy in front
+mem8 serve --http 0.0.0.0:8080 --insecure                  # ok, and unwise
+```
+
+A bearer token on a plaintext connection is readable by anything on the path,
+and a captured token is complete access to every memory. The compose file binds
+`127.0.0.1:8080` and expects a TLS-terminating proxy in front.
+
+### What this does not protect against
+
+Worth reading before exposing it to anything:
+
+- **One token, one trust level.** Every caller who authenticates can read and
+  write every project. There is no per-user isolation.
+- **No rate limiting and no audit log.** A stolen token is unlimited, and leaves
+  no trace beyond the memories it changes.
+- **No rotation.** Changing the token means restarting the server.
+
+This is built for a private network or a VPN, with TLS and a real secret. It is
+not built to face the public internet.
+
 ## Backup
 
 ```bash
@@ -134,6 +250,9 @@ mem8 import memories.md
 
 Import always creates new memories; it never overwrites or deduplicates
 against existing ones, so importing the same file twice doubles the entries.
+
+The markdown format carries no embeddings, so run `mem8 reindex` after an
+import if you use semantic search.
 
 ### Markdown format
 
@@ -183,12 +302,17 @@ Run `cargo fmt` before every commit.
 Version 0.1.0. It works, and it is used daily by its author — but it is young,
 and these are the things worth knowing before you rely on it.
 
-**Search is keyword-only.** Every word in a query must appear in a memory for it
-to match, so a memory recorded as "we chose the porter tokenizer" is not found by
-"why did we pick the porter tokenizer" — `chose` and `pick` are different words.
-Search with two or three distinctive keywords and try different words if nothing
-comes back. Semantic search is the obvious next step; the schema reserves an
-`embedding` column for it.
+**Search is keyword-only by default.** Every word in a query must appear in a
+memory for it to match, so a memory recorded as "we chose the porter tokenizer"
+is not found by "why did we pick the porter tokenizer" — `chose` and `pick` are
+different words. Search with two or three distinctive keywords and try different
+words if nothing comes back. [Semantic search](#semantic-search) fixes this, but
+needs Postgres and a larger binary.
+
+**Semantic search is new and Postgres-only.** SQLite — the default — cannot do
+it. It has been verified against a real pgvector database and the real
+embedding model, but it has not yet been used daily the way keyword search
+has.
 
 **Only tested on Windows.** The code has no platform-specific logic and the test
 suite should pass anywhere, but nobody has run it on macOS or Linux yet.
@@ -201,11 +325,27 @@ against a real server, but SQLite is the default and has had far more use.
 ```bash
 cargo test                                              # SQLite only
 MEM8_TEST_PG=postgres://localhost/mem8_test cargo test  # includes Postgres
+
+# Vector search, against a real pgvector database
+docker compose up -d
+MEM8_TEST_PG=postgres://mem8:mem8@localhost:5432/mem8 \
+  cargo test --features semantic --test pg_vector
+
+# The real embedding model. Downloads ~130 MB on first run, so it is opt-in
+# twice and never runs in CI.
+MEM8_TEST_EMBED=1 cargo test --features semantic --test real_model
 ```
 
 The test suite covers the storage backends against a shared contract, the core
 service, the MCP tool surface, an end-to-end handshake against the real binary
-over stdio, and an export/import round trip.
+over stdio, an export/import round trip, the Postgres schema-version guard
+(including two processes migrating at once), and vector search against a real
+pgvector database.
+
+`real_model` is the one suite that exercises the actual embedding model. It
+asserts the claim the feature rests on: that a reworded question lands closer to
+a memory than an unrelated sentence does, and that an exact identifier is not
+displaced by a semantically similar memory.
 
 `docs/superpowers/` holds the design spec and the implementation plan the project
 was built from, if you want the reasoning behind a decision.

@@ -37,13 +37,31 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The default build must stay lean and keyword-only, so the semantic
+      # feature is checked separately rather than folded into the matrix.
+      # Compile only: the tests that matter for it need Postgres with pgvector
+      # (the job below) or a 130 MB model download (never in CI).
+      - name: Build with the semantic feature
+        run: cargo clippy --features semantic --all-targets -- -D warnings
+
+      # The HTTP transport carries the auth and TLS guards, so unlike the
+      # semantic feature its tests run rather than only compiling: they need
+      # nothing but a loopback socket.
+      - name: Test the HTTP transport
+        run: cargo clippy --features http --all-targets -- -D warnings
+
+      - name: Run the HTTP transport tests
+        run: cargo test --features http --test http_serve
+
   postgres:
     name: postgres contract
     runs-on: ubuntu-latest
 
     services:
       postgres:
-        image: postgres:16-alpine
+        # pgvector rather than stock postgres: the schema-v2 migration runs
+        # `CREATE EXTENSION vector`, so a plain image cannot even connect.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: mem8_test
@@ -65,4 +83,12 @@ jobs:
       - name: Run the contract suite against Postgres
         env:
           MEM8_TEST_PG: postgres://postgres:postgres@localhost:5432/mem8_test
-        run: cargo test --test store_contract
+        run: cargo test --test store_contract --test pg_migration
+
+      # Vector search only exists with the feature on, and only on Postgres.
+      # `real_model` stays out: it needs the model download and is gated behind
+      # MEM8_TEST_EMBED for local runs.
+      - name: Run vector search against pgvector
+        env:
+          MEM8_TEST_PG: postgres://postgres:postgres@localhost:5432/mem8_test
+        run: cargo test --features semantic --test pg_vector --test pg_migration

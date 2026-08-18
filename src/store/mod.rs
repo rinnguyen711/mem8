@@ -2,7 +2,7 @@ pub mod postgres;
 pub mod sqlite;
 
 use crate::error::{Mem8Error, Result};
-use crate::model::{Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery};
+use crate::model::{Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use async_trait::async_trait;
 use chrono::Utc;
 use std::path::PathBuf;
@@ -23,6 +23,26 @@ pub trait Store: Send + Sync {
     async fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>>;
     /// Every memory, ordered by `created_at` ascending. Used by `mem8 export`.
     async fn all(&self) -> Result<Vec<Memory>>;
+
+    /// Memories ranked by embedding similarity, nearest first.
+    ///
+    /// Filters apply before ranking, exactly as in `search`. Rows with no
+    /// stored embedding are skipped — they are not "distant", they are
+    /// unrepresented, and ranking them at all would put arbitrary memories in
+    /// front of real matches.
+    ///
+    /// Backends that cannot do this return `Mem8Error::Unsupported` rather than
+    /// an empty result: "this backend has no vector search" and "nothing
+    /// matched" call for different responses from the caller, and an empty Vec
+    /// cannot distinguish them.
+    async fn vector_search(&self, query: VectorQuery) -> Result<Vec<SearchHit>>;
+
+    /// Memories with no stored embedding, oldest first, for `mem8 reindex`.
+    async fn missing_embeddings(&self, limit: usize) -> Result<Vec<Memory>>;
+
+    /// Attach an embedding to an existing memory without touching its content
+    /// or `updated_at`. Backfill is not an edit.
+    async fn set_embedding(&self, id: Uuid, embedding: &[f32]) -> Result<()>;
 }
 
 /// In-memory `Store` used by `core` unit tests. Substring matching stands in
@@ -40,7 +60,9 @@ pub struct MemStore {
 
 impl MemStore {
     pub fn new() -> Self {
-        Self { rows: Mutex::new(Vec::new()) }
+        Self {
+            rows: Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -62,7 +84,7 @@ impl Store for MemStore {
             tags: new.tags,
             created_at: now,
             updated_at: now,
-            embedding: None,
+            embedding: new.embedding,
         };
         self.rows.lock().unwrap().push(memory.clone());
         Ok(memory)
@@ -93,6 +115,9 @@ impl Store for MemStore {
         }
         if let Some(tags) = update.tags {
             row.tags = tags;
+        }
+        if let Some(embedding) = update.embedding {
+            row.embedding = Some(embedding);
         }
         row.updated_at = Utc::now();
         Ok(row.clone())
@@ -132,7 +157,10 @@ impl Store for MemStore {
                 needles.iter().all(|n| content.contains(n.as_str()))
             })
             .take(query.limit)
-            .map(|m| SearchHit { memory: m.clone(), score: 1.0 })
+            .map(|m| SearchHit {
+                memory: m.clone(),
+                score: 1.0,
+            })
             .collect();
         Ok(hits)
     }
@@ -141,6 +169,53 @@ impl Store for MemStore {
         let mut rows = self.rows.lock().unwrap().clone();
         rows.sort_by_key(|m| m.created_at);
         Ok(rows)
+    }
+
+    async fn vector_search(&self, query: VectorQuery) -> Result<Vec<SearchHit>> {
+        let rows = self.rows.lock().unwrap();
+        let mut hits: Vec<SearchHit> = rows
+            .iter()
+            .filter(|m| query.global || query.project.as_deref() == Some(m.project.as_str()))
+            .filter(|m| query.kind.is_none_or(|k| k == m.kind))
+            .filter(|m| query.tags.iter().all(|t| m.tags.contains(t)))
+            .filter_map(|m| {
+                // No embedding means unrepresented, not distant: skip rather
+                // than score, matching what the real backends do with NULL.
+                let stored = m.embedding.as_ref()?;
+                Some(SearchHit {
+                    memory: m.clone(),
+                    score: crate::embed::cosine_similarity(&query.embedding, stored) as f64,
+                })
+            })
+            .collect();
+
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(query.limit);
+        Ok(hits)
+    }
+
+    async fn missing_embeddings(&self, limit: usize) -> Result<Vec<Memory>> {
+        let mut rows: Vec<Memory> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.embedding.is_none())
+            .cloned()
+            .collect();
+        rows.sort_by_key(|m| m.created_at);
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn set_embedding(&self, id: Uuid, embedding: &[f32]) -> Result<()> {
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|m| m.id == id)
+            .ok_or_else(|| Mem8Error::NotFound(id.to_string()))?;
+        row.embedding = Some(embedding.to_vec());
+        Ok(())
     }
 }
 
@@ -190,6 +265,7 @@ mod tests {
             kind: Kind::Decision,
             content: content.into(),
             tags: vec![],
+            ..Default::default()
         }
     }
 
@@ -259,6 +335,7 @@ mod tests {
                 kind: crate::model::Kind::Fact,
                 content: "persisted".into(),
                 tags: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();

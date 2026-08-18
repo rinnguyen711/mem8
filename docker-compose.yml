@@ -1,0 +1,88 @@
+# Postgres with pgvector, and optionally mem8 itself.
+#
+# Default — the database only. The agent spawns the mem8 binary locally and
+# talks to it over stdio; only Postgres is containerised.
+#
+#   docker compose up -d
+#   export MEM8_DB=postgres://mem8:mem8@localhost:5432/mem8
+#
+# With the `server` profile — mem8 runs as a shared HTTP service as well. Opt-in
+# so that `docker compose up` for a local database never publishes a server by
+# accident:
+#
+#   export MEM8_TOKEN=$(openssl rand -hex 32)
+#   docker compose --profile server up -d
+#
+# The passwords below are development defaults for services published on
+# localhost. Change them before exposing any of this to a network.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: mem8
+      POSTGRES_PASSWORD: mem8
+      POSTGRES_DB: mem8
+    ports:
+      # Bound to the loopback interface, not 0.0.0.0, so the default password
+      # is not reachable from the network.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - mem8-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` reports ready while the server is still restarting after
+      # first-boot initialisation, so `start_period` covers that window rather
+      # than letting a client connect into a dropped connection.
+      test: ["CMD-SHELL", "pg_isready -U mem8 -d mem8"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Opt-in via `--profile server`. Not part of a default `up`.
+  mem8:
+    profiles: ["server"]
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      mem8-init:
+        condition: service_completed_successfully
+    environment:
+      MEM8_DB: postgres://mem8:mem8@db:5432/mem8
+      # Passed through with no default. Compose interpolates every service's
+      # variables regardless of profile, so a `:?` guard here would break a
+      # plain `docker compose up` for the database alone. The check belongs to
+      # the server anyway: mem8 refuses to start over HTTP without a token,
+      # with an error saying how to generate one.
+      MEM8_TOKEN: ${MEM8_TOKEN:-}
+    ports:
+      # Loopback only. This container serves plaintext HTTP (see the Dockerfile
+      # CMD), so publishing it on 0.0.0.0 would put the bearer token on the
+      # network in the clear. Put a TLS-terminating proxy in front to expose it.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Keeps the ~130 MB embedding model across container restarts.
+      - mem8-models:/home/mem8/.fastembed_cache
+    restart: unless-stopped
+
+  # Gives the model volume to the unprivileged user, once, before the server
+  # starts.
+  #
+  # Docker creates a named volume's mountpoint owned by root and mounts it over
+  # whatever the image had at that path, so a `chown` in the Dockerfile is
+  # discarded. The server runs as uid 10001 and would find the cache read-only:
+  # the model download fails, and mem8 degrades to keyword-only search with an
+  # error that reads like a network problem. This container is the only thing
+  # here that needs root, and it exits immediately.
+  mem8-init:
+    profiles: ["server"]
+    image: busybox:1.36
+    command: ["sh", "-c", "chown -R 10001:10001 /cache"]
+    volumes:
+      - mem8-models:/cache
+    restart: "no"
+
+volumes:
+  mem8-data:
+  mem8-models:

@@ -22,6 +22,14 @@ pub enum Mem8Error {
 
     #[error("database schema version {found} is newer than this binary supports ({expected}); upgrade mem8")]
     Migration { found: i32, expected: i32 },
+
+    /// A backend cannot do something another backend can.
+    ///
+    /// Returned rather than an empty result: semantic search on SQLite finding
+    /// nothing is indistinguishable from a genuine miss, and that difference is
+    /// exactly what the caller needs to know.
+    #[error("{backend} does not support {feature}")]
+    Unsupported { feature: String, backend: String },
 }
 
 pub type Result<T> = std::result::Result<T, Mem8Error>;
@@ -38,7 +46,10 @@ mod tests {
 
     #[test]
     fn migration_error_names_both_versions() {
-        let e = Mem8Error::Migration { found: 3, expected: 2 };
+        let e = Mem8Error::Migration {
+            found: 3,
+            expected: 2,
+        };
         let msg = e.to_string();
         assert!(msg.contains('3') && msg.contains('2'));
     }

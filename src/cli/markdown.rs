@@ -55,13 +55,20 @@ pub fn from_markdown(text: &str) -> Result<Vec<NewMemory>> {
 
     // Split the input into chunks starting at each section-heading line.
     let lines: Vec<&str> = text.lines().collect();
-    let mut section_starts: Vec<usize> =
-        lines.iter().enumerate().filter(|(_, l)| is_section_heading(l)).map(|(i, _)| i).collect();
+    let mut section_starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_section_heading(l))
+        .map(|(i, _)| i)
+        .collect();
     section_starts.push(lines.len());
 
     for window in section_starts.windows(2) {
         let (start, end) = (window[0], window[1]);
-        let heading_id = lines[start].strip_prefix("## ").unwrap_or(lines[start]).trim();
+        let heading_id = lines[start]
+            .strip_prefix("## ")
+            .unwrap_or(lines[start])
+            .trim();
         let mut project = String::new();
         let mut kind: Option<Kind> = None;
         let mut tags: Vec<String> = Vec::new();
@@ -121,7 +128,16 @@ pub fn from_markdown(text: &str) -> Result<Vec<NewMemory>> {
             )));
         }
 
-        memories.push(NewMemory { project, kind, content, tags });
+        // Import never carries an embedding: the markdown format does not
+        // record one, and reconstructing it here would mean loading a model in
+        // a code path that otherwise needs none. `mem8 reindex` backfills.
+        memories.push(NewMemory {
+            project,
+            kind,
+            content,
+            tags,
+            embedding: None,
+        });
     }
 
     Ok(memories)
@@ -198,7 +214,10 @@ mod tests {
 
     #[test]
     fn tags_containing_commas_survive_roundtrip() {
-        let original = vec![memory("Some content.", vec!["a,b".to_string(), "c".to_string()])];
+        let original = vec![memory(
+            "Some content.",
+            vec!["a,b".to_string(), "c".to_string()],
+        )];
 
         let text = to_markdown(&original);
         let parsed = from_markdown(&text).unwrap();
@@ -224,7 +243,10 @@ mod tests {
     fn missing_project_in_a_file_is_an_error() {
         let text = "## 7a1f7a1f-7a1f-7a1f-7a1f-7a1f7a1f7a1f\n- kind: decision\n- tags:\n- created: 2026-08-11T00:00:00+00:00\n\nBody.\n";
         let err = from_markdown(text).unwrap_err().to_string();
-        assert!(err.contains("project"), "error should mention 'project', got: {err}");
+        assert!(
+            err.contains("project"),
+            "error should mention 'project', got: {err}"
+        );
     }
 
     #[test]

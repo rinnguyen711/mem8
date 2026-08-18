@@ -12,3 +12,6 @@
 /memories.md
 *.mem.md
 *-export.md
+
+# Downloaded embedding model (~130 MB), fetched on first use
+/.fastembed_cache/

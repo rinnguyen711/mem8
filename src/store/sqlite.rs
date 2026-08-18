@@ -1,6 +1,6 @@
 use super::Store;
 use crate::error::{Mem8Error, Result};
-use crate::model::{Kind, Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery};
+use crate::model::{Kind, Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -76,14 +76,19 @@ impl SqliteStore {
             .map_err(store_err)?;
 
         if found > SCHEMA_VERSION {
-            return Err(Mem8Error::Migration { found, expected: SCHEMA_VERSION });
+            return Err(Mem8Error::Migration {
+                found,
+                expected: SCHEMA_VERSION,
+            });
         }
         if found < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(store_err)?;
         }
 
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -109,12 +114,10 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
     let created: String = row.get("created_at")?;
     let updated: String = row.get("updated_at")?;
 
-    let parsed_id =
-        Uuid::parse_str(&id).map_err(|e| column_parse_error("id", &id, e))?;
-    let parsed_kind =
-        Kind::from_str(&kind).map_err(|e| column_parse_error("kind", &kind, e))?;
-    let parsed_tags: Vec<String> = serde_json::from_str(&tags)
-        .map_err(|e| column_parse_error("tags", &tags, e))?;
+    let parsed_id = Uuid::parse_str(&id).map_err(|e| column_parse_error("id", &id, e))?;
+    let parsed_kind = Kind::from_str(&kind).map_err(|e| column_parse_error("kind", &kind, e))?;
+    let parsed_tags: Vec<String> =
+        serde_json::from_str(&tags).map_err(|e| column_parse_error("tags", &tags, e))?;
     let created_at = DateTime::parse_from_rfc3339(&created)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| column_parse_error("created_at", &created, e))?;
@@ -207,7 +210,13 @@ impl Store for SqliteStore {
             )
             .map_err(store_err)?;
 
-        Ok(Memory { content, kind, tags, updated_at, ..current })
+        Ok(Memory {
+            content,
+            kind,
+            tags,
+            updated_at,
+            ..current
+        })
     }
 
     async fn delete(&self, id: Uuid) -> Result<()> {
@@ -215,7 +224,10 @@ impl Store for SqliteStore {
             .conn
             .lock()
             .unwrap()
-            .execute("DELETE FROM memories WHERE id = ?1", params![id.to_string()])
+            .execute(
+                "DELETE FROM memories WHERE id = ?1",
+                params![id.to_string()],
+            )
             .map_err(store_err)?;
 
         if changed == 0 {
@@ -253,7 +265,10 @@ impl Store for SqliteStore {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let score: f64 = row.get("score")?;
-                Ok(SearchHit { memory: row_to_memory(row)?, score: -score })
+                Ok(SearchHit {
+                    memory: row_to_memory(row)?,
+                    score: -score,
+                })
             })
             .map_err(store_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -283,6 +298,32 @@ impl Store for SqliteStore {
             .map_err(store_err)?;
         Ok(rows)
     }
+
+    /// Not supported: SQLite is keyword-only.
+    ///
+    /// Semantic search was scoped to Postgres deliberately. Returning an error
+    /// rather than an empty result is the point — an empty Vec would be
+    /// indistinguishable from "nothing matched", and a caller would silently
+    /// believe it had searched semantically when it had not.
+    async fn vector_search(&self, _query: VectorQuery) -> Result<Vec<SearchHit>> {
+        Err(Mem8Error::Unsupported {
+            feature: "semantic search".into(),
+            backend: "the SQLite backend".into(),
+        })
+    }
+
+    /// Always empty: nothing here can hold an embedding, so nothing is missing
+    /// one. `mem8 reindex` therefore finds no work rather than failing.
+    async fn missing_embeddings(&self, _limit: usize) -> Result<Vec<Memory>> {
+        Ok(Vec::new())
+    }
+
+    async fn set_embedding(&self, _id: Uuid, _embedding: &[f32]) -> Result<()> {
+        Err(Mem8Error::Unsupported {
+            feature: "storing embeddings".into(),
+            backend: "the SQLite backend".into(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +341,7 @@ mod tests {
             kind: Kind::Decision,
             content: content.into(),
             tags: vec!["rust".into()],
+            ..Default::default()
         }
     }
 
@@ -309,6 +351,7 @@ mod tests {
             kind: Kind::Decision,
             content: content.into(),
             tags: tags.into_iter().map(String::from).collect(),
+            ..Default::default()
         }
     }
 
@@ -326,7 +369,10 @@ mod tests {
     #[tokio::test]
     async fn add_then_get_roundtrips_all_fields() {
         let s = store();
-        let added = s.add(new_memory("p1", "we chose rust for the binary")).await.unwrap();
+        let added = s
+            .add(new_memory("p1", "we chose rust for the binary"))
+            .await
+            .unwrap();
         let got = s.get(added.id).await.unwrap();
         assert_eq!(got.content, "we chose rust for the binary");
         assert_eq!(got.kind, Kind::Decision);
@@ -338,7 +384,9 @@ mod tests {
     #[tokio::test]
     async fn fts_finds_memory_by_word() {
         let s = store();
-        s.add(new_memory("p1", "we chose rust for the binary")).await.unwrap();
+        s.add(new_memory("p1", "we chose rust for the binary"))
+            .await
+            .unwrap();
         let hits = s.search(query("rust", "p1")).await.unwrap();
         assert_eq!(hits.len(), 1);
     }
@@ -378,11 +426,21 @@ mod tests {
         // then filters by tag in Rust, which can strip tagged rows that never
         // made it past the SQL limit and under-return. The correct semantic
         // (matching MemStore) is: filter by tag first, then limit to 3.
-        s.add(new_memory_with_tags("p1", "widget one", vec!["drop"])).await.unwrap();
-        s.add(new_memory_with_tags("p1", "widget two", vec!["drop"])).await.unwrap();
-        s.add(new_memory_with_tags("p1", "widget three", vec!["keep"])).await.unwrap();
-        s.add(new_memory_with_tags("p1", "widget four", vec!["keep"])).await.unwrap();
-        s.add(new_memory_with_tags("p1", "widget five", vec!["keep"])).await.unwrap();
+        s.add(new_memory_with_tags("p1", "widget one", vec!["drop"]))
+            .await
+            .unwrap();
+        s.add(new_memory_with_tags("p1", "widget two", vec!["drop"]))
+            .await
+            .unwrap();
+        s.add(new_memory_with_tags("p1", "widget three", vec!["keep"]))
+            .await
+            .unwrap();
+        s.add(new_memory_with_tags("p1", "widget four", vec!["keep"]))
+            .await
+            .unwrap();
+        s.add(new_memory_with_tags("p1", "widget five", vec!["keep"]))
+            .await
+            .unwrap();
 
         let mut q = query("widget", "p1");
         q.tags = vec!["keep".into()];
@@ -390,13 +448,18 @@ mod tests {
 
         let hits = s.search(q).await.unwrap();
         assert_eq!(hits.len(), 3);
-        assert!(hits.iter().all(|h| h.memory.tags.contains(&"keep".to_string())));
+        assert!(hits
+            .iter()
+            .all(|h| h.memory.tags.contains(&"keep".to_string())));
     }
 
     #[tokio::test]
     async fn corrupt_row_errors_instead_of_fabricating() {
         let s = store();
-        let added = s.add(new_memory("p1", "we chose rust for the binary")).await.unwrap();
+        let added = s
+            .add(new_memory("p1", "we chose rust for the binary"))
+            .await
+            .unwrap();
 
         s.conn
             .lock()
@@ -410,6 +473,9 @@ mod tests {
         let result = s.get(added.id).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("banana"), "error message should mention the bad value: {msg}");
+        assert!(
+            msg.contains("banana"),
+            "error message should mention the bad value: {msg}"
+        );
     }
 }
