@@ -7,6 +7,9 @@
 # Scratch from the subagent-driven development workflow
 /.superpowers/
 
+# Git worktrees for isolated feature work
+/.worktrees/
+
 # Local memory exports
 /mem.md
 /memories.md
