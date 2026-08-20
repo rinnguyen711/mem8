@@ -3,6 +3,7 @@ use crate::error::{Mem8Error, Result};
 use crate::model::{Kind, Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use crate::scope::detect_scope;
 use crate::store::Store;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -236,6 +237,33 @@ pub enum ScopeMode {
     Explicit,
 }
 
+/// Everything a search can be narrowed by, apart from the query text itself.
+///
+/// A struct rather than positional parameters because two of these fields are
+/// `bool` -- `global` and `include_superseded` -- and transposing them compiles
+/// silently while producing a plausible wrong answer: a project-scoped search
+/// that leaks dead facts, or a global one that hides live ones. Named fields put
+/// the mistake where the compiler can catch it.
+///
+/// Deliberately free of `serde`/`schemars` derives: this is the internal service
+/// API, and the MCP layer owns its own wire type shaped by JSON-schema
+/// concerns. Mapping between them at the handler is ordinary boundary
+/// translation.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    pub project: Option<String>,
+    pub global: bool,
+    pub kind: Option<Kind>,
+    pub tags: Vec<String>,
+    pub limit: Option<usize>,
+    /// Return superseded memories alongside live ones. Defaults to false:
+    /// discovery should surface what is currently true.
+    pub include_superseded: bool,
+    /// Answer as of a past instant -- what was believed then. Rejected in
+    /// combination with `include_superseded`.
+    pub as_of: Option<DateTime<Utc>>,
+}
+
 /// The memory service. Owns validation and scope resolution so that the MCP
 /// server and the CLI behave identically.
 pub struct Memory8 {
@@ -319,12 +347,19 @@ impl Memory8 {
         }
     }
 
+    /// Store a memory, optionally recording that it replaces an existing one.
+    ///
+    /// `supersedes` names a memory in the same project that this one makes
+    /// obsolete. The old memory is invalidated rather than deleted: search stops
+    /// returning it, but `get` still does, which is what keeps "we used SQLite
+    /// until 2026-08-17" answerable.
     pub async fn add(
         &self,
         content: &str,
         kind: Kind,
         tags: Vec<String>,
         project: Option<String>,
+        supersedes: Option<Uuid>,
     ) -> Result<Memory> {
         if content.trim().is_empty() {
             return Err(Mem8Error::InvalidInput("content must not be empty".into()));
@@ -333,26 +368,77 @@ impl Memory8 {
         let content = content.trim().to_string();
         let project = self.resolve_scope(project)?;
 
+        // Validate before embedding. Every check runs before anything is
+        // written, so a rejected supersede costs neither a model pass nor a
+        // partial write.
+        if let Some(old_id) = supersedes {
+            let target = self.store.get(old_id).await?;
+
+            if target.project != project {
+                return Err(Mem8Error::InvalidInput(format!(
+                    "cannot supersede memory {old_id}: it belongs to project '{}', \
+                     but this memory is being written to '{}'. A cross-project \
+                     supersession is far more likely a mistaken id than an intent.",
+                    target.project, project
+                )));
+            }
+
+            // Keyed on `invalid_at`, not `superseded_by`. A memory can be dead
+            // with an unknown successor -- markdown import records the
+            // invalidation without always knowing which memory replaced it --
+            // and such a row must be refused here too. Checking
+            // `superseded_by` alone would let it through and then fail deeper
+            // in the store's write-once guard with a message that says nothing
+            // about what the caller should do instead.
+            if let Some(invalid_at) = target.invalid_at {
+                return Err(Mem8Error::InvalidInput(match target.superseded_by {
+                    Some(existing) => format!(
+                        "memory {old_id} is already superseded by {existing}; \
+                         supersede that one instead so the chain stays linear"
+                    ),
+                    None => format!(
+                        "memory {old_id} was already invalidated as of {}, with no \
+                         recorded successor; it is no longer current, so there is \
+                         nothing left for this memory to replace",
+                        invalid_at.to_rfc3339()
+                    ),
+                }));
+            }
+        }
+
         let embedding = self.try_embed(&content);
 
         // Revise a near-identical memory rather than storing it twice. Only the
         // resolved project is considered, so this can never merge across scopes.
-        if let Some(existing) = self.find_duplicate(&content, &project).await {
-            return self
-                .store
-                .update(
-                    existing.id,
-                    MemoryUpdate {
-                        content: Some(content),
-                        kind: Some(kind),
-                        tags: Some(tags),
-                        embedding,
-                    },
-                )
-                .await;
+        //
+        // An explicit `supersedes` skips duplicate detection entirely: the
+        // agent has already stated what this memory replaces, and re-deriving
+        // it by word overlap can only disagree with a direct answer.
+        if supersedes.is_none() {
+            if let Some(existing) = self.find_duplicate(&content, &project).await {
+                return self
+                    .store
+                    .update(
+                        existing.id,
+                        MemoryUpdate {
+                            content: Some(content),
+                            kind: Some(kind),
+                            tags: Some(tags),
+                            embedding,
+                        },
+                    )
+                    .await;
+            }
         }
 
-        self.store
+        // Write the new memory first, then invalidate the old one pointing at
+        // it. The reverse order leaves a window in which the old fact is dead
+        // and nothing has replaced it, and a crash inside that window loses the
+        // fact entirely. In this order a crash after the first step leaves two
+        // live memories -- the condition that exists today, which the next
+        // write can still repair.
+        let created = self
+            .store
             .add(NewMemory {
                 project,
                 kind,
@@ -360,7 +446,15 @@ impl Memory8 {
                 tags,
                 embedding,
             })
-            .await
+            .await?;
+
+        if let Some(old_id) = supersedes {
+            self.store
+                .supersede(old_id, Some(created.id), Utc::now())
+                .await?;
+        }
+
+        Ok(created)
     }
 
     /// The stored memory this content would duplicate, if any.
@@ -381,6 +475,9 @@ impl Memory8 {
                 kind: None,
                 tags: Vec::new(),
                 limit: MAX_LIMIT,
+                // Never merge a new write into a memory that is already dead.
+                include_superseded: false,
+                as_of: None,
             })
             .await
             .ok()?;
@@ -392,6 +489,11 @@ impl Memory8 {
             .map(|(_, memory)| memory)
     }
 
+    /// Fetch a memory by id, superseded or not.
+    ///
+    /// Never filters on `invalid_at`. A replaced memory is hidden from search
+    /// but still readable here, which is what keeps "we used SQLite until
+    /// 2026-08-17" answerable.
     pub async fn get(&self, id: Uuid) -> Result<Memory> {
         self.store.get(id).await
     }
@@ -435,29 +537,34 @@ impl Memory8 {
         self.store.delete(id).await
     }
 
-    pub async fn search(
-        &self,
-        query: &str,
-        project: Option<String>,
-        global: bool,
-        kind: Option<Kind>,
-        tags: Vec<String>,
-        limit: Option<usize>,
-    ) -> Result<Vec<SearchHit>> {
+    pub async fn search(&self, query: &str, opts: SearchOptions) -> Result<Vec<SearchHit>> {
+        // `as_of` already specifies exactly which rows count, so combining it
+        // with `include_superseded` is a contradiction rather than a
+        // refinement. Reject rather than silently favouring one -- the stores
+        // resolve it by letting `as_of` win, but a caller who set both did not
+        // decide that, and guessing hides a mistake.
+        if opts.as_of.is_some() && opts.include_superseded {
+            return Err(Mem8Error::InvalidInput(
+                "as_of and include_superseded cannot be combined: as_of already \
+                 determines which memories were valid at that time"
+                    .into(),
+            ));
+        }
+
         if query.trim().is_empty() {
             return Err(Mem8Error::InvalidInput("query must not be empty".into()));
         }
 
         let text = sanitize_fts_query(query)?;
-        let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let limit = opts.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         // A global search deliberately crosses every project, so there is
         // nothing to resolve and nothing to refuse. It is explicit about its
         // own breadth, which is the opposite of the accidental cross-project
         // write that `Explicit` mode exists to prevent.
-        let project = if global {
+        let project = if opts.global {
             None
         } else {
-            Some(self.resolve_scope(project)?)
+            Some(self.resolve_scope(opts.project.clone())?)
         };
         let scope = project.clone().unwrap_or_else(|| "*".to_string());
 
@@ -466,10 +573,12 @@ impl Memory8 {
             .search(SearchQuery {
                 text: text.clone(),
                 project: project.clone(),
-                global,
-                kind,
-                tags: tags.clone(),
+                global: opts.global,
+                kind: opts.kind,
+                tags: opts.tags.clone(),
                 limit,
+                include_superseded: opts.include_superseded,
+                as_of: opts.as_of,
             })
             .await?;
 
@@ -477,10 +586,7 @@ impl Memory8 {
         // finds exact identifiers -- `SqliteStore`, `auth-token`, a commit hash
         // -- which embeddings match poorly, so replacing it would trade one
         // class of failure for another.
-        let hits = match self
-            .vector_hits(query, project, global, kind, &tags, limit)
-            .await
-        {
+        let hits = match self.vector_hits(query, project, limit, &opts).await {
             Some(vector) if !vector.is_empty() => reciprocal_rank_fusion(&[keyword, vector], limit),
             _ => keyword,
         };
@@ -499,14 +605,17 @@ impl Memory8 {
     /// embedding that could not be computed, or a store error. Search working
     /// less well is a far better outcome than search not working, and the
     /// SQLite default hits the `Unsupported` path on every single query.
+    /// `project` and `limit` are passed separately from `opts` because both are
+    /// already resolved by the caller: `project` is the scope `search` worked
+    /// out (which is `None` for a global search, not `opts.project`), and
+    /// `limit` has been defaulted and clamped. Re-deriving either here would
+    /// risk the vector query disagreeing with the keyword one.
     async fn vector_hits(
         &self,
         query: &str,
         project: Option<String>,
-        global: bool,
-        kind: Option<Kind>,
-        tags: &[String],
         limit: usize,
+        opts: &SearchOptions,
     ) -> Option<Vec<SearchHit>> {
         let embedding = self.try_embed(query)?;
 
@@ -515,10 +624,15 @@ impl Memory8 {
             .vector_search(VectorQuery {
                 embedding,
                 project,
-                global,
-                kind,
-                tags: tags.to_vec(),
+                global: opts.global,
+                kind: opts.kind,
+                tags: opts.tags.clone(),
                 limit,
+                // Every filter that applies to keyword search must apply here
+                // too, or a semantic hit resurrects a fact the keyword path
+                // correctly hid.
+                include_superseded: opts.include_superseded,
+                as_of: opts.as_of,
             })
             .await
         {
@@ -599,7 +713,7 @@ mod tests {
     async fn add_rejects_empty_content() {
         let svc = service();
         let err = svc
-            .add("   ", Kind::Fact, vec![], Some("p1".into()))
+            .add("   ", Kind::Fact, vec![], Some("p1".into()), None)
             .await
             .unwrap_err();
         assert!(matches!(err, Mem8Error::InvalidInput(_)));
@@ -610,7 +724,7 @@ mod tests {
     async fn add_uses_explicit_project_over_detection() {
         let svc = service();
         let m = svc
-            .add("a fact", Kind::Fact, vec![], Some("explicit".into()))
+            .add("a fact", Kind::Fact, vec![], Some("explicit".into()), None)
             .await
             .unwrap();
         assert_eq!(m.project, "explicit");
@@ -619,17 +733,17 @@ mod tests {
     #[tokio::test]
     async fn add_falls_back_to_detected_scope() {
         let svc = service();
-        let m = svc.add("a fact", Kind::Fact, vec![], None).await.unwrap();
+        let m = svc
+            .add("a fact", Kind::Fact, vec![], None, None)
+            .await
+            .unwrap();
         assert!(!m.project.is_empty(), "detected scope must never be empty");
     }
 
     #[tokio::test]
     async fn search_rejects_empty_query() {
         let svc = service();
-        let err = svc
-            .search("", None, false, None, vec![], None)
-            .await
-            .unwrap_err();
+        let err = svc.search("", SearchOptions::default()).await.unwrap_err();
         assert!(matches!(err, Mem8Error::InvalidInput(_)));
     }
 
@@ -642,12 +756,20 @@ mod tests {
                 Kind::Fact,
                 vec![],
                 Some("p1".into()),
+                None,
             )
             .await
             .unwrap();
         }
         let hits = svc
-            .search("fact", Some("p1".into()), false, None, vec![], Some(999))
+            .search(
+                "fact",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    limit: Some(999),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -665,12 +787,19 @@ mod tests {
                 Kind::Fact,
                 vec![],
                 Some("p1".into()),
+                None,
             )
             .await
             .unwrap();
         }
         let hits = svc
-            .search("fact", Some("p1".into()), false, None, vec![], None)
+            .search(
+                "fact",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(hits.len(), DEFAULT_LIMIT);
@@ -763,6 +892,7 @@ mod tests {
                 Kind::Decision,
                 vec![],
                 Some("p1".into()),
+                None,
             )
             .await
             .unwrap();
@@ -772,6 +902,7 @@ mod tests {
                 Kind::Decision,
                 vec![],
                 Some("p1".into()),
+                None,
             )
             .await
             .unwrap();
@@ -794,6 +925,7 @@ mod tests {
             Kind::Decision,
             vec![],
             Some("p1".into()),
+            None,
         )
         .await
         .unwrap();
@@ -802,6 +934,7 @@ mod tests {
             Kind::Decision,
             vec![],
             Some("p1".into()),
+            None,
         )
         .await
         .unwrap();
@@ -821,6 +954,7 @@ mod tests {
             Kind::Convention,
             vec![],
             Some("p1".into()),
+            None,
         )
         .await
         .unwrap();
@@ -829,6 +963,7 @@ mod tests {
             Kind::Convention,
             vec![],
             Some("p2".into()),
+            None,
         )
         .await
         .unwrap();
@@ -844,12 +979,24 @@ mod tests {
     async fn a_search_that_finds_nothing_still_succeeds() {
         // The miss log is best-effort; a search must return Ok either way.
         let svc = service();
-        svc.add("we chose rust", Kind::Decision, vec![], Some("p1".into()))
-            .await
-            .unwrap();
+        svc.add(
+            "we chose rust",
+            Kind::Decision,
+            vec![],
+            Some("p1".into()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let hits = svc
-            .search("kubernetes", Some("p1".into()), false, None, vec![], None)
+            .search(
+                "kubernetes",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(hits.is_empty());
@@ -869,7 +1016,13 @@ mod tests {
     async fn update_trims_content_like_add_does() {
         let svc = service();
         let added = svc
-            .add("  spaced out  ", Kind::Fact, vec![], Some("p1".into()))
+            .add(
+                "  spaced out  ",
+                Kind::Fact,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(added.content, "spaced out");
@@ -905,7 +1058,7 @@ mod tests {
         // one name, silently. Refusing is the only honest answer.
         let svc = explicit_service();
         let err = svc
-            .add("a fact", Kind::Fact, vec![], None)
+            .add("a fact", Kind::Fact, vec![], None, None)
             .await
             .unwrap_err();
 
@@ -921,7 +1074,7 @@ mod tests {
     async fn explicit_mode_accepts_a_named_project() {
         let svc = explicit_service();
         let m = svc
-            .add("a fact", Kind::Fact, vec![], Some("named".into()))
+            .add("a fact", Kind::Fact, vec![], Some("named".into()), None)
             .await
             .unwrap();
         assert_eq!(m.project, "named");
@@ -933,7 +1086,7 @@ mod tests {
         // that no one can search for by name.
         let svc = explicit_service();
         let err = svc
-            .add("a fact", Kind::Fact, vec![], Some("   ".into()))
+            .add("a fact", Kind::Fact, vec![], Some("   ".into()), None)
             .await
             .unwrap_err();
         assert!(matches!(err, Mem8Error::InvalidInput(_)));
@@ -943,7 +1096,7 @@ mod tests {
     async fn explicit_mode_refuses_a_scoped_search_with_no_project() {
         let svc = explicit_service();
         let err = svc
-            .search("anything", None, false, None, vec![], None)
+            .search("anything", SearchOptions::default())
             .await
             .unwrap_err();
         assert!(matches!(err, Mem8Error::InvalidInput(_)));
@@ -954,12 +1107,24 @@ mod tests {
         // `global: true` is explicit about crossing projects, which is the
         // opposite of the accidental misfile this mode prevents.
         let svc = explicit_service();
-        svc.add("we chose rust", Kind::Decision, vec![], Some("p1".into()))
-            .await
-            .unwrap();
+        svc.add(
+            "we chose rust",
+            Kind::Decision,
+            vec![],
+            Some("p1".into()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let hits = svc
-            .search("rust", None, true, None, vec![], None)
+            .search(
+                "rust",
+                SearchOptions {
+                    global: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("a global search names no project by design");
         assert_eq!(hits.len(), 1);
@@ -969,7 +1134,10 @@ mod tests {
     async fn detect_mode_still_infers_the_project() {
         // stdio is the default and must not regress.
         let svc = service();
-        let m = svc.add("a fact", Kind::Fact, vec![], None).await.unwrap();
+        let m = svc
+            .add("a fact", Kind::Fact, vec![], None, None)
+            .await
+            .unwrap();
         assert!(!m.project.is_empty(), "detection must still work locally");
     }
 
@@ -977,7 +1145,13 @@ mod tests {
     async fn explicit_mode_trims_the_project_name() {
         let svc = explicit_service();
         let m = svc
-            .add("a fact", Kind::Fact, vec![], Some("  spaced  ".into()))
+            .add(
+                "a fact",
+                Kind::Fact,
+                vec![],
+                Some("  spaced  ".into()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1007,6 +1181,8 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 embedding: None,
+                superseded_by: None,
+                invalid_at: None,
             },
             score,
         }
@@ -1071,7 +1247,13 @@ mod tests {
     async fn writes_carry_an_embedding_when_one_is_configured() {
         let svc = semantic_service();
         let m = svc
-            .add("we chose rust", Kind::Decision, vec![], Some("p1".into()))
+            .add(
+                "we chose rust",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1087,7 +1269,13 @@ mod tests {
     async fn writes_have_no_embedding_without_an_embedder() {
         let svc = service();
         let m = svc
-            .add("we chose rust", Kind::Decision, vec![], Some("p1".into()))
+            .add(
+                "we chose rust",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
             .await
             .unwrap();
         assert!(svc.get(m.id).await.unwrap().embedding.is_none());
@@ -1132,16 +1320,36 @@ mod tests {
             async fn set_embedding(&self, _id: Uuid, _e: &[f32]) -> Result<()> {
                 Ok(())
             }
+            async fn supersede(
+                &self,
+                old: Uuid,
+                new: Option<Uuid>,
+                at: chrono::DateTime<chrono::Utc>,
+            ) -> Result<()> {
+                self.0.supersede(old, new, at).await
+            }
         }
 
         let svc =
             Memory8::with_embedder(Arc::new(NoVectors(MemStore::new())), Arc::new(FakeEmbedder));
-        svc.add("we chose rust", Kind::Decision, vec![], Some("p1".into()))
-            .await
-            .unwrap();
+        svc.add(
+            "we chose rust",
+            Kind::Decision,
+            vec![],
+            Some("p1".into()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let hits = svc
-            .search("rust", Some("p1".into()), false, None, vec![], None)
+            .search(
+                "rust",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1154,15 +1362,33 @@ mod tests {
     #[tokio::test]
     async fn vector_search_does_not_cross_project_scope() {
         let svc = semantic_service();
-        svc.add("we chose rust", Kind::Decision, vec![], Some("p1".into()))
-            .await
-            .unwrap();
-        svc.add("we chose rust", Kind::Decision, vec![], Some("p2".into()))
-            .await
-            .unwrap();
+        svc.add(
+            "we chose rust",
+            Kind::Decision,
+            vec![],
+            Some("p1".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        svc.add(
+            "we chose rust",
+            Kind::Decision,
+            vec![],
+            Some("p2".into()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let hits = svc
-            .search("rust", Some("p1".into()), false, None, vec![], None)
+            .search(
+                "rust",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -1185,6 +1411,7 @@ mod tests {
                     Kind::Fact,
                     vec![],
                     Some("p1".into()),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1215,6 +1442,7 @@ mod tests {
                     Kind::Fact,
                     vec![],
                     Some("p1".into()),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1248,7 +1476,13 @@ mod tests {
 
         let svc = Memory8::with_embedder(Arc::new(MemStore::new()), Arc::new(BrokenEmbedder));
         let m = svc
-            .add("still worth keeping", Kind::Fact, vec![], Some("p1".into()))
+            .add(
+                "still worth keeping",
+                Kind::Fact,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
             .await
             .expect("a failing embedder must not fail the write");
 
@@ -1258,9 +1492,692 @@ mod tests {
 
         // And it remains findable the ordinary way.
         let hits = svc
-            .search("worth", Some("p1".into()), false, None, vec![], None)
+            .search(
+                "worth",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    // --- Task 7: explicit supersession on the write path ---------------------
+
+    #[tokio::test]
+    async fn supersedes_hides_the_old_memory_and_links_them() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let old = service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let new = service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap();
+
+        let fetched = service.get(old.id).await.unwrap();
+        assert_eq!(fetched.superseded_by, Some(new.id));
+        assert!(fetched.invalid_at.is_some());
+
+        let hits = service
+            .search(
+                "storage",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.memory.id).collect();
+        assert!(!ids.contains(&old.id));
+        assert!(ids.contains(&new.id));
+    }
+
+    #[tokio::test]
+    async fn superseding_a_missing_memory_is_not_found_and_writes_nothing() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let absent = Uuid::new_v4();
+
+        let err = service
+            .add(
+                "new fact",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(absent),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Mem8Error::NotFound(_)));
+
+        // Nothing was written: validation precedes both writes.
+        assert!(service.all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseding_across_projects_is_rejected() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let other = service
+            .add(
+                "other project fact",
+                Kind::Decision,
+                vec![],
+                Some("p2".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = service
+            .add(
+                "new fact",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(other.id),
+            )
+            .await
+            .unwrap_err();
+
+        // A cross-project supersession is far more likely a mistaken id than
+        // intent.
+        assert!(matches!(err, Mem8Error::InvalidInput(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("p1") && message.contains("p2"),
+            "got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_an_already_superseded_memory_is_rejected() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let first = service
+            .add("v1", Kind::Decision, vec![], Some("p1".into()), None)
+            .await
+            .unwrap();
+        let second = service
+            .add(
+                "v2 entirely different words",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(first.id),
+            )
+            .await
+            .unwrap();
+
+        // Chains stay linear: a memory has at most one successor.
+        let err = service
+            .add(
+                "v3 other words again",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(first.id),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Mem8Error::InvalidInput(_)));
+        assert!(
+            err.to_string().contains(&second.id.to_string()),
+            "error must name the existing successor, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_a_dead_memory_with_no_known_successor_is_rejected() {
+        // After markdown import a memory can be dead with an unknown successor:
+        // `invalid_at` set, `superseded_by` NULL. Superseding it again must be
+        // refused here, with a message of its own, rather than falling through
+        // to the store's write-once rejection. This is why the guard keys on
+        // `invalid_at` rather than `superseded_by`.
+        let store = Arc::new(MemStore::new());
+        let service = Memory8::new(store.clone());
+        let dead = service
+            .add("retired fact", Kind::Fact, vec![], Some("p1".into()), None)
+            .await
+            .unwrap();
+        store.supersede(dead.id, None, Utc::now()).await.unwrap();
+
+        let err = service
+            .add(
+                "the replacement fact",
+                Kind::Fact,
+                vec![],
+                Some("p1".into()),
+                Some(dead.id),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Mem8Error::InvalidInput(_)));
+        assert!(
+            err.to_string().contains("recorded successor"),
+            "the message must say the successor is unknown, got: {err}"
+        );
+        assert_eq!(
+            service.all().await.unwrap().len(),
+            1,
+            "a rejected supersede must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_supersedes_skips_duplicate_detection() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let old = service
+            .add(
+                "we use the porter tokenizer",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Near-identical content would normally be revised in place. With an
+        // explicit supersedes the agent has already said what this replaces, so
+        // re-deriving it by word overlap can only disagree with a direct answer.
+        let new = service
+            .add(
+                "we use the porter tokenizer",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            new.id, old.id,
+            "must create a new memory, not revise the old one"
+        );
+        assert_eq!(service.all().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_detection_ignores_superseded_memories() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let old = service
+            .add(
+                "we use the porter tokenizer",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let replacement = service
+            .add(
+                "something else entirely",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap();
+
+        // Re-saving the old wording must not merge into the dead memory.
+        let fresh = service
+            .add(
+                "we use the porter tokenizer",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            fresh.id, old.id,
+            "a new write must never merge into a dead memory"
+        );
+        assert_ne!(fresh.id, replacement.id);
+    }
+
+    /// The ordering guarantee, proven rather than asserted in a comment.
+    ///
+    /// If invalidating the old memory fails, the surviving state must be the
+    /// recoverable one: the new memory present, the old one still live. The
+    /// reverse -- old dead, new missing -- would lose the fact outright.
+    #[tokio::test]
+    async fn a_failed_supersede_leaves_the_new_memory_and_keeps_the_old_one_live() {
+        struct SupersedeFails(MemStore);
+
+        #[async_trait::async_trait]
+        impl Store for SupersedeFails {
+            async fn add(&self, new: NewMemory) -> Result<Memory> {
+                self.0.add(new).await
+            }
+            async fn get(&self, id: Uuid) -> Result<Memory> {
+                self.0.get(id).await
+            }
+            async fn update(&self, id: Uuid, u: MemoryUpdate) -> Result<Memory> {
+                self.0.update(id, u).await
+            }
+            async fn delete(&self, id: Uuid) -> Result<()> {
+                self.0.delete(id).await
+            }
+            async fn search(&self, q: SearchQuery) -> Result<Vec<SearchHit>> {
+                self.0.search(q).await
+            }
+            async fn all(&self) -> Result<Vec<Memory>> {
+                self.0.all().await
+            }
+            async fn vector_search(&self, q: VectorQuery) -> Result<Vec<SearchHit>> {
+                self.0.vector_search(q).await
+            }
+            async fn missing_embeddings(&self, limit: usize) -> Result<Vec<Memory>> {
+                self.0.missing_embeddings(limit).await
+            }
+            async fn set_embedding(&self, id: Uuid, e: &[f32]) -> Result<()> {
+                self.0.set_embedding(id, e).await
+            }
+            async fn supersede(
+                &self,
+                _old: Uuid,
+                _new: Option<Uuid>,
+                _at: chrono::DateTime<chrono::Utc>,
+            ) -> Result<()> {
+                Err(Mem8Error::Store(
+                    "simulated crash before invalidation".into(),
+                ))
+            }
+        }
+
+        let service = Memory8::new(Arc::new(SupersedeFails(MemStore::new())));
+        let old = service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Mem8Error::Store(_)));
+
+        let all = service.all().await.unwrap();
+        assert_eq!(all.len(), 2, "the new memory must survive the failure");
+        assert!(
+            all.iter().any(|m| m.content == "storage is postgres"),
+            "the replacement was written before the invalidation was attempted"
+        );
+
+        let old = service.get(old.id).await.unwrap();
+        assert!(
+            old.invalid_at.is_none(),
+            "the old memory must still be live, so the next write can repair the state"
+        );
+        assert_eq!(old.superseded_by, None);
+    }
+
+    /// Validation precedes the embed call, proven by counting model passes.
+    ///
+    /// A rejected supersede must cost nothing. Reading the line order shows the
+    /// `return Err`s sit above `try_embed`, but a counter proves it holds at
+    /// runtime for every rejection path.
+    #[tokio::test]
+    async fn a_rejected_supersede_costs_no_embedding_pass() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingEmbedder(Arc<AtomicUsize>);
+        impl Embed for CountingEmbedder {
+            fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                self.0.fetch_add(texts.len(), Ordering::SeqCst);
+                Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(MemStore::new());
+        let service =
+            Memory8::with_embedder(store.clone(), Arc::new(CountingEmbedder(calls.clone())));
+
+        // One legitimate write, to show the embedder is genuinely wired up.
+        let live = service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let other = service
+            .add(
+                "other project fact",
+                Kind::Decision,
+                vec![],
+                Some("p2".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let baseline = calls.load(Ordering::SeqCst);
+        assert_eq!(baseline, 2, "the embedder must actually be in use");
+
+        // Rejection 1: the target does not exist.
+        service
+            .add(
+                "a",
+                Kind::Fact,
+                vec![],
+                Some("p1".into()),
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .unwrap_err();
+
+        // Rejection 2: the target belongs to another project.
+        service
+            .add("b", Kind::Fact, vec![], Some("p1".into()), Some(other.id))
+            .await
+            .unwrap_err();
+
+        // Rejection 3: the target is already dead.
+        store.supersede(live.id, None, Utc::now()).await.unwrap();
+        service
+            .add("c", Kind::Fact, vec![], Some("p1".into()), Some(live.id))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            baseline,
+            "no rejected supersede may spend a model pass"
+        );
+    }
+
+    // --- Task 8: reading the past through core::search -----------------------
+
+    #[tokio::test]
+    async fn as_of_with_include_superseded_is_rejected() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let err = service
+            .search(
+                "x",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    include_superseded: true,
+                    as_of: Some(Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Mem8Error::InvalidInput(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("as_of") && message.contains("include_superseded"),
+            "error must name both parameters, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn include_superseded_returns_dead_memories_through_core() {
+        let service = Memory8::new(Arc::new(MemStore::new()));
+        let old = service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                Some(old.id),
+            )
+            .await
+            .unwrap();
+
+        let live = service
+            .search(
+                "storage",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1, "default search hides the superseded memory");
+
+        let all = service
+            .search(
+                "storage",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    include_superseded: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "include_superseded returns both");
+    }
+
+    #[tokio::test]
+    async fn as_of_answers_what_was_believed_then_through_core() {
+        let store = Arc::new(MemStore::new());
+        let service = Memory8::new(store.clone());
+        let old = service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let new = service
+            .add(
+                "storage is postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Invalidate with an explicit instant rather than letting `add`'s
+        // internal `Utc::now()` choose one, so the validity window is ten
+        // seconds wide by construction.
+        //
+        // A window derived from two wall-clock samples is not safe to probe:
+        // `created_at` is stored raw but `invalid_at` is truncated to
+        // microseconds, and truncation only ever moves a value earlier, so on a
+        // nanosecond clock the window can come out zero-width or inverted and
+        // no probe instant exists at all. That is a Linux-only failure -- macOS
+        // `Utc::now()` is already microsecond-resolution -- which is precisely
+        // the platform split `store::truncate_for_storage` exists to close.
+        // The contract suite anchors on fixed offsets from `created_at` for the
+        // same reason; this mirrors it.
+        let at = old.created_at + chrono::Duration::seconds(10);
+        store.supersede(old.id, Some(new.id), at).await.unwrap();
+
+        let invalidated = service.get(old.id).await.unwrap().invalid_at.unwrap();
+        assert!(
+            invalidated > old.created_at,
+            "supersession must be observably later than creation"
+        );
+
+        // Before the invalidation the old fact was still believed.
+        let before = service
+            .search(
+                "storage",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    as_of: Some(invalidated - chrono::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(before.iter().any(|h| h.memory.id == old.id));
+
+        // Exactly at the invalidation it is already dead: the predicate is
+        // `invalid_at > T`, so T == invalid_at excludes it.
+        let at_boundary = service
+            .search(
+                "storage",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    as_of: Some(invalidated),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!at_boundary.iter().any(|h| h.memory.id == old.id));
+
+        // Neither memory existed before the first one was created.
+        let ancient = service
+            .search(
+                "storage",
+                SearchOptions {
+                    project: Some("p1".into()),
+                    as_of: Some(old.created_at - chrono::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            ancient.is_empty(),
+            "nothing existed before the first memory"
+        );
+    }
+
+    /// The same filters must reach vector search, not only keyword search.
+    ///
+    /// Without this, threading the two fields into `SearchQuery` alone leaves a
+    /// silent gap: keyword search hides the dead fact and the semantic path
+    /// resurrects it. Unit tests with no embedder never exercise the vector
+    /// path at all, so this one configures the fake embedder and asserts on
+    /// hits that could only have come from it.
+    #[tokio::test]
+    async fn superseded_memories_stay_hidden_from_the_vector_path() {
+        // Built inline rather than via `semantic_service()` so the store handle
+        // is available for an explicit `supersede`, as in the test above.
+        let store = Arc::new(MemStore::new());
+        let service = Memory8::with_embedder(store.clone(), Arc::new(FakeEmbedder));
+        let old = service
+            .add(
+                "storage is sqlite",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let new = service
+            .add(
+                "the persistence layer runs on postgres",
+                Kind::Decision,
+                vec![],
+                Some("p1".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // An explicit instant, for the truncation reason spelled out in
+        // `as_of_answers_what_was_believed_then_through_core`: a window derived
+        // from two wall-clock samples can be zero-width or inverted.
+        let at = old.created_at + chrono::Duration::seconds(10);
+        store.supersede(old.id, Some(new.id), at).await.unwrap();
+
+        let invalidated = service.get(old.id).await.unwrap().invalid_at.unwrap();
+        assert!(
+            invalidated > old.created_at,
+            "supersession must be observably later than creation"
+        );
+
+        // A query sharing no keyword with either memory: any hit at all must
+        // have come through the embedding path.
+        let query = "which database do we persist to";
+        let live = service
+            .search(
+                query,
+                SearchOptions {
+                    project: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !live.is_empty(),
+            "the fake embedder must produce vector hits for a keyword-free query"
+        );
+        assert!(
+            !live.iter().any(|h| h.memory.id == old.id),
+            "the vector path must not resurrect a superseded memory; got: {:?}",
+            live.iter().map(|h| &h.memory.content).collect::<Vec<_>>()
+        );
+
+        // And `as_of` must reach it too: inside the old memory's validity
+        // window it is visible again through the same path.
+        let before = service
+            .search(
+                query,
+                SearchOptions {
+                    project: Some("p1".into()),
+                    as_of: Some(invalidated - chrono::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            before.iter().any(|h| h.memory.id == old.id),
+            "as_of must reach the vector query, not just the keyword one"
+        );
     }
 }

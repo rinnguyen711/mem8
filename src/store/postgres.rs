@@ -1,4 +1,4 @@
-use super::Store;
+use super::{truncate_for_storage, Store};
 use crate::error::{Mem8Error, Result};
 use crate::model::{Kind, Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use async_trait::async_trait;
@@ -12,7 +12,8 @@ use uuid::Uuid;
 ///
 /// 1 — the original table, with `embedding BYTEA` as an unused placeholder.
 /// 2 — `embedding` becomes a real `vector(384)` column with an HNSW index.
-pub const PG_SCHEMA_VERSION: i32 = 2;
+/// 3 — `superseded_by` / `invalid_at`, so a fact can record what replaced it.
+pub const PG_SCHEMA_VERSION: i32 = 3;
 
 /// The base table, as it has existed since v1. `migrate` brings it forward from
 /// here.
@@ -29,7 +30,9 @@ const SCHEMA: &[&str] = &[
         tags        TEXT[] NOT NULL DEFAULT '{}',
         created_at  TIMESTAMPTZ NOT NULL,
         updated_at  TIMESTAMPTZ NOT NULL,
-        embedding   BYTEA
+        embedding   BYTEA,
+        superseded_by UUID,
+        invalid_at    TIMESTAMPTZ
     )",
     "CREATE INDEX IF NOT EXISTS idx_project ON memories(project)",
     "CREATE INDEX IF NOT EXISTS idx_project_kind ON memories(project, kind)",
@@ -48,6 +51,22 @@ const MIGRATE_V2: &[&str] = &[
     "ALTER TABLE memories ADD COLUMN embedding vector(384)",
     "CREATE INDEX IF NOT EXISTS idx_embedding
         ON memories USING hnsw (embedding vector_cosine_ops)",
+];
+
+/// Version 3: record that one fact replaced another.
+///
+/// `IF NOT EXISTS` so the statements are a no-op on a database that got the
+/// columns from `SCHEMA` directly. Existing rows migrate to NULL/NULL and stay
+/// live.
+///
+/// `invalid_at` is `TIMESTAMPTZ`, matching `created_at`/`updated_at`. SQLite
+/// stores the same field as RFC3339 TEXT only because every other timestamp
+/// there is text; Postgres has typed timestamps and the search predicates
+/// compare this column against a bound `timestamptz`, so there is nothing for a
+/// text column to buy here.
+const MIGRATE_V3: &[&str] = &[
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by UUID",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ",
 ];
 
 pub struct PgStore {
@@ -195,6 +214,18 @@ async fn migrate(pool: &PgPool) -> Result<()> {
         }
     }
 
+    if found < 3 {
+        // Purely additive, so unlike v2 there is nothing to guard: no column is
+        // dropped and no existing value is rewritten. Every pre-existing row
+        // gets NULL/NULL, which is exactly "live and never superseded".
+        for statement in MIGRATE_V3 {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+        }
+    }
+
     // One row, always. DELETE-then-INSERT rather than UPDATE so a database
     // that had no row ends up with exactly one.
     sqlx::query("DELETE FROM mem8_meta")
@@ -259,6 +290,11 @@ fn row_to_memory(row: &PgRow) -> Result<Memory> {
         created_at: row.get::<DateTime<Utc>, _>("created_at"),
         updated_at: row.get::<DateTime<Utc>, _>("updated_at"),
         embedding: None,
+        // Native sqlx types, so no parsing step and no `column_parse_error`
+        // case: Postgres rejects a malformed uuid or timestamp at write time,
+        // unlike SQLite's TEXT columns which have to be parsed on read.
+        superseded_by: row.get::<Option<Uuid>, _>("superseded_by"),
+        invalid_at: row.get::<Option<DateTime<Utc>>, _>("invalid_at"),
     })
 }
 
@@ -356,14 +392,20 @@ impl Store for PgStore {
                AND ($2::bool OR project = $3)
                AND ($4::text IS NULL OR kind = $4)
                AND ($5::text[] = '{}' OR tags @> $5)
+               AND ($6::timestamptz IS NOT NULL OR $7::bool OR invalid_at IS NULL)
+               AND ($6::timestamptz IS NULL
+                    OR (created_at <= $6
+                        AND (invalid_at IS NULL OR invalid_at > $6)))
              ORDER BY score DESC
-             LIMIT $6",
+             LIMIT $8",
         )
         .bind(&query.text)
         .bind(query.global)
         .bind(query.project.clone().unwrap_or_default())
         .bind(query.kind.map(|k| k.to_string()))
         .bind(&query.tags)
+        .bind(query.as_of)
+        .bind(query.include_superseded)
         .bind(query.limit as i64)
         .fetch_all(&self.pool)
         .await
@@ -406,14 +448,20 @@ impl Store for PgStore {
                AND ($2::bool OR project = $3)
                AND ($4::text IS NULL OR kind = $4)
                AND ($5::text[] = '{}' OR tags @> $5)
+               AND ($6::timestamptz IS NOT NULL OR $7::bool OR invalid_at IS NULL)
+               AND ($6::timestamptz IS NULL
+                    OR (created_at <= $6
+                        AND (invalid_at IS NULL OR invalid_at > $6)))
              ORDER BY distance ASC
-             LIMIT $6",
+             LIMIT $8",
         )
         .bind(pgvector::Vector::from(query.embedding.clone()))
         .bind(query.global)
         .bind(query.project.clone().unwrap_or_default())
         .bind(query.kind.map(|k| k.to_string()))
         .bind(&query.tags)
+        .bind(query.as_of)
+        .bind(query.include_superseded)
         .bind(query.limit as i64)
         .fetch_all(&self.pool)
         .await
@@ -470,6 +518,67 @@ impl Store for PgStore {
 
         if result.rows_affected() == 0 {
             return Err(Mem8Error::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()> {
+        // One statement sets both columns, so `invalid_at` is never set without
+        // the successor being decided in the same write. `new` may be NULL --
+        // known dead, successor unknown -- but the reverse (a successor with no
+        // invalidation time) is incoherent and unreachable from here.
+        //
+        // `at` is truncated to microseconds first: that is all TIMESTAMPTZ can
+        // hold, so doing it here rather than letting Postgres round on write is
+        // what makes this backend and SQLite store the identical instant. See
+        // `truncate_for_storage`.
+        //
+        // `AND invalid_at IS NULL` makes invalidation write-once in one atomic
+        // statement, so two concurrent callers cannot both pass a
+        // read-then-write check. Moving `invalid_at` later would resurrect the
+        // memory for every `as_of` query between the two instants -- an
+        // append-only temporal record silently rewritten.
+        let at = truncate_for_storage(at);
+        let result = sqlx::query(
+            "UPDATE memories SET superseded_by = $1, invalid_at = $2
+             WHERE id = $3 AND invalid_at IS NULL",
+        )
+        .bind(new)
+        .bind(at)
+        .bind(old)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+
+        if result.rows_affected() == 0 {
+            // Zero rows now means either "no such memory" or "already
+            // superseded", and the caller needs to tell those apart: one is a
+            // bad id, the other a rejected duplicate. Re-read to decide.
+            //
+            // The outer Option is "was there a row"; the inner one is the
+            // nullable column. They cannot both be exercised at once -- a
+            // present row necessarily has `invalid_at` set, or the UPDATE would
+            // have matched it -- but the type still admits the shape, so it is
+            // handled rather than unwrapped.
+            let existing: Option<Option<DateTime<Utc>>> =
+                sqlx::query_scalar("SELECT invalid_at FROM memories WHERE id = $1")
+                    .bind(old)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(store_err)?;
+
+            return match existing {
+                None => Err(Mem8Error::NotFound(old.to_string())),
+                // Worded and formatted exactly as SqliteStore words it -- the
+                // RFC3339 spelling included -- so a caller reading the message
+                // cannot tell which backend answered.
+                Some(invalid_at) => Err(Mem8Error::InvalidInput(format!(
+                    "memory {old} is already superseded as of {}",
+                    invalid_at
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "an unknown time".into())
+                ))),
+            };
         }
         Ok(())
     }

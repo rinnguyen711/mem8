@@ -66,6 +66,23 @@ pub struct Memory {
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// The memory that replaced this one, if its successor is known.
+    ///
+    /// Written only alongside `invalid_at`: a successor with no invalidation
+    /// time is incoherent and must never be stored. The converse is legitimate
+    /// — `invalid_at` set with `superseded_by` NULL means the memory is known
+    /// dead but its replacement is unknown, which import produces when a file
+    /// names a successor it does not contain.
+    ///
+    /// The invariant is enforced in the store layer rather than by a database
+    /// constraint, so both backends behave identically and the rule lives next
+    /// to the code that applies it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Uuid>,
+    /// When this memory stopped being true. `None` means it is still live, and
+    /// search will filter on this field alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +134,17 @@ pub struct SearchQuery {
     pub kind: Option<Kind>,
     pub tags: Vec<String>,
     pub limit: usize,
+    /// Return superseded memories alongside live ones. Defaults to false:
+    /// discovery should surface what is currently true.
+    pub include_superseded: bool,
+    /// Answer as of a past instant — what was believed then.
+    ///
+    /// Mutually exclusive with `include_superseded` and rejected together at
+    /// the tool boundary: `as_of` already specifies exactly which rows count,
+    /// so combining them is a contradiction rather than a refinement. Stores
+    /// resolve it by letting `as_of` win rather than trusting the boundary,
+    /// so a direct caller cannot produce a nonsense result.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 /// A search by embedding similarity rather than by words.
@@ -133,6 +161,17 @@ pub struct VectorQuery {
     pub kind: Option<Kind>,
     pub tags: Vec<String>,
     pub limit: usize,
+    /// Return superseded memories alongside live ones. Defaults to false:
+    /// discovery should surface what is currently true.
+    pub include_superseded: bool,
+    /// Answer as of a past instant — what was believed then.
+    ///
+    /// Mutually exclusive with `include_superseded` and rejected together at
+    /// the tool boundary: `as_of` already specifies exactly which rows count,
+    /// so combining them is a contradiction rather than a refinement. Stores
+    /// resolve it by letting `as_of` win rather than trusting the boundary,
+    /// so a direct caller cannot produce a nonsense result.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +183,59 @@ pub struct SearchHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn live_memory_omits_supersession_fields_from_json() {
+        let now = Utc::now();
+        let m = Memory {
+            id: Uuid::new_v4(),
+            project: "p".into(),
+            kind: Kind::Decision,
+            content: "invalid_at and superseded_by appear in this content".into(),
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            superseded_by: None,
+            invalid_at: None,
+        };
+
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("superseded_by"),
+            "a live memory must serialize exactly as before, got: {v}"
+        );
+        assert!(!obj.contains_key("invalid_at"), "got: {v}");
+    }
+
+    #[test]
+    fn superseded_memory_includes_both_fields_in_json() {
+        let now = Utc::now();
+        let successor = Uuid::new_v4();
+        let m = Memory {
+            id: Uuid::new_v4(),
+            project: "p".into(),
+            kind: Kind::Decision,
+            content: "c".into(),
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            superseded_by: Some(successor),
+            invalid_at: Some(now),
+        };
+
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj["superseded_by"],
+            serde_json::json!(successor.to_string()),
+            "got: {v}"
+        );
+        assert!(obj.contains_key("invalid_at"), "got: {v}");
+    }
 
     #[test]
     fn kind_parses_from_lowercase() {
@@ -168,5 +260,34 @@ mod tests {
         for k in Kind::ALL {
             assert_eq!(k.to_string().parse::<Kind>().unwrap(), k);
         }
+    }
+
+    #[test]
+    fn query_defaults_hide_superseded_and_set_no_as_of() {
+        let q = SearchQuery {
+            text: "x".into(),
+            project: None,
+            global: false,
+            kind: None,
+            tags: vec![],
+            limit: 10,
+            include_superseded: false,
+            as_of: None,
+        };
+        assert!(!q.include_superseded);
+        assert!(q.as_of.is_none());
+
+        let v = VectorQuery {
+            embedding: vec![0.0; 3],
+            project: None,
+            global: false,
+            kind: None,
+            tags: vec![],
+            limit: 10,
+            include_superseded: false,
+            as_of: None,
+        };
+        assert!(!v.include_superseded);
+        assert!(v.as_of.is_none());
     }
 }

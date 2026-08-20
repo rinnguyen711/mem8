@@ -4,7 +4,7 @@ pub mod sqlite;
 use crate::error::{Mem8Error, Result};
 use crate::model::{Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, SubsecRound, Utc};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -43,6 +43,62 @@ pub trait Store: Send + Sync {
     /// Attach an embedding to an existing memory without touching its content
     /// or `updated_at`. Backfill is not an edit.
     async fn set_embedding(&self, id: Uuid, embedding: &[f32]) -> Result<()>;
+
+    /// Mark `old` as no longer true as of `at`, replaced by `new`.
+    ///
+    /// `new` is `Option` because a memory can be known dead with an unknown
+    /// successor: import may load a memory whose replacement is not present in
+    /// the file, and the alternative — dropping the invalidation — would
+    /// resurrect a fact the export recorded as dead. That is the failure
+    /// round-tripping exists to prevent, so the store must be able to express
+    /// it. `None` is reachable only from import; every other caller passes
+    /// `Some`.
+    ///
+    /// The invariant is therefore: `invalid_at` is set whenever the memory is
+    /// dead, and `superseded_by` is set whenever its successor is known. A row
+    /// with `superseded_by` set but `invalid_at` NULL is incoherent and must
+    /// never be written.
+    ///
+    /// Invalidation is **write-once**. A memory that already carries an
+    /// `invalid_at` is rejected with `InvalidInput`; the existing timestamp is
+    /// never moved. Moving it later would resurrect the memory for every
+    /// `as_of` query between the old and new instants — a fact that was dead at
+    /// T would start reading as live at T — and that corrupts an append-only
+    /// temporal record rather than merely losing an update. Only the store can
+    /// guarantee this, so it is enforced here and not left to `core`.
+    ///
+    /// Returns `NotFound` if `old` does not exist. Validation of the
+    /// *relationship* — same project, correct successor — belongs to `core`,
+    /// not here: the store records the fact, it does not police intent. The
+    /// write-once rule is the exception, because it protects the integrity of
+    /// the record itself rather than the caller's intent.
+    ///
+    /// `at` is truncated to microseconds by every implementation — see
+    /// [`truncate_for_storage`]. A caller therefore cannot rely on
+    /// nanosecond precision surviving the write.
+    async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()>;
+}
+
+/// Round an invalidation instant down to microsecond precision.
+///
+/// Postgres's `TIMESTAMPTZ` holds only microseconds, while SQLite stores the
+/// same field as RFC3339 text and keeps all nine digits. An untruncated instant
+/// therefore lands differently in the two backends, and an `as_of` falling
+/// between the truncated and full values reads the memory as dead on Postgres
+/// and live on SQLite — the backends disagreeing about a single instant.
+///
+/// The divergence is invisible on macOS, where `Utc::now()` is already
+/// microsecond-resolution, and live on Linux, where it returns true
+/// nanoseconds. That makes it exactly the kind of bug that passes locally and
+/// fails in CI, so it is fixed at the point of entry rather than documented:
+/// every `supersede` implementation truncates before storing, so all three
+/// agree regardless of which one a caller holds.
+///
+/// Truncating (rather than rounding to nearest) keeps the stored instant at or
+/// before the one the caller supplied, so an invalidation never moves later
+/// than the event it records.
+pub fn truncate_for_storage(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.trunc_subsecs(6)
 }
 
 /// In-memory `Store` used by `core` unit tests. Substring matching stands in
@@ -72,6 +128,23 @@ impl Default for MemStore {
     }
 }
 
+/// Whether a memory is visible under a query's temporal filters.
+///
+/// Three modes, one predicate:
+/// - default: live only (`invalid_at IS NULL`)
+/// - `include_superseded`: everything
+/// - `as_of: T`: what was believed at T
+///
+/// `as_of` wins when both are set: it already specifies exactly which rows
+/// count. The tool boundary rejects that combination outright, but the store
+/// stays total over its input so a direct caller cannot produce nonsense.
+fn visible_at(memory: &Memory, include_superseded: bool, as_of: Option<DateTime<Utc>>) -> bool {
+    match as_of {
+        Some(t) => memory.created_at <= t && memory.invalid_at.is_none_or(|invalid| invalid > t),
+        None => include_superseded || memory.invalid_at.is_none(),
+    }
+}
+
 #[async_trait]
 impl Store for MemStore {
     async fn add(&self, new: NewMemory) -> Result<Memory> {
@@ -85,6 +158,8 @@ impl Store for MemStore {
             created_at: now,
             updated_at: now,
             embedding: new.embedding,
+            superseded_by: None,
+            invalid_at: None,
         };
         self.rows.lock().unwrap().push(memory.clone());
         Ok(memory)
@@ -156,6 +231,7 @@ impl Store for MemStore {
                 let content = m.content.to_lowercase();
                 needles.iter().all(|n| content.contains(n.as_str()))
             })
+            .filter(|m| visible_at(m, query.include_superseded, query.as_of))
             .take(query.limit)
             .map(|m| SearchHit {
                 memory: m.clone(),
@@ -178,6 +254,7 @@ impl Store for MemStore {
             .filter(|m| query.global || query.project.as_deref() == Some(m.project.as_str()))
             .filter(|m| query.kind.is_none_or(|k| k == m.kind))
             .filter(|m| query.tags.iter().all(|t| m.tags.contains(t)))
+            .filter(|m| visible_at(m, query.include_superseded, query.as_of))
             .filter_map(|m| {
                 // No embedding means unrepresented, not distant: skip rather
                 // than score, matching what the real backends do with NULL.
@@ -215,6 +292,32 @@ impl Store for MemStore {
             .find(|m| m.id == id)
             .ok_or_else(|| Mem8Error::NotFound(id.to_string()))?;
         row.embedding = Some(embedding.to_vec());
+        Ok(())
+    }
+
+    async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()> {
+        // Truncated here as well, so `core` tests against `MemStore` observe
+        // the same precision they will get from a real backend.
+        let at = truncate_for_storage(at);
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|m| m.id == old)
+            .ok_or_else(|| Mem8Error::NotFound(old.to_string()))?;
+
+        // Write-once, matching the real backends. `MemStore` exists so that
+        // `core` tests exercise the same contract they will meet in
+        // production; letting it accept a second invalidation here would hide
+        // the SQL backends' rejection until integration time.
+        if let Some(existing) = row.invalid_at {
+            return Err(Mem8Error::InvalidInput(format!(
+                "memory {old} is already superseded as of {}",
+                existing.to_rfc3339()
+            )));
+        }
+
+        row.superseded_by = new;
+        row.invalid_at = Some(at);
         Ok(())
     }
 }
@@ -277,6 +380,8 @@ mod tests {
             kind: None,
             tags: vec![],
             limit: 10,
+            include_superseded: false,
+            as_of: None,
         }
     }
 
@@ -346,6 +451,87 @@ mod tests {
         // the file locked while the handle is open.
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn search_hides_superseded_by_default() {
+        let store = MemStore::new();
+        let old = store.add(new_memory("p1", "use sqlite")).await.unwrap();
+        let new = store.add(new_memory("p1", "use sqlite now")).await.unwrap();
+        store
+            .supersede(old.id, Some(new.id), Utc::now())
+            .await
+            .unwrap();
+
+        let hits = store.search(query("sqlite", "p1")).await.unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.memory.id).collect();
+        assert!(!ids.contains(&old.id), "superseded memory must be hidden");
+        assert!(ids.contains(&new.id), "its replacement must be returned");
+    }
+
+    #[tokio::test]
+    async fn include_superseded_returns_both() {
+        let store = MemStore::new();
+        let old = store.add(new_memory("p1", "use sqlite")).await.unwrap();
+        let new = store.add(new_memory("p1", "use sqlite now")).await.unwrap();
+        store
+            .supersede(old.id, Some(new.id), Utc::now())
+            .await
+            .unwrap();
+
+        let q = SearchQuery {
+            include_superseded: true,
+            ..query("sqlite", "p1")
+        };
+        assert_eq!(store.search(q).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_still_returns_a_superseded_memory() {
+        let store = MemStore::new();
+        let old = store.add(new_memory("p1", "use sqlite")).await.unwrap();
+        let new = store.add(new_memory("p1", "use sqlite now")).await.unwrap();
+        store
+            .supersede(old.id, Some(new.id), Utc::now())
+            .await
+            .unwrap();
+
+        // Hidden from discovery, not deleted. This distinction is the whole reason
+        // supersession is not delete_memory.
+        let got = store.get(old.id).await.unwrap();
+        assert_eq!(got.content, "use sqlite");
+        assert_eq!(got.superseded_by, Some(new.id));
+    }
+
+    #[tokio::test]
+    async fn superseding_twice_is_rejected_and_keeps_the_first_timestamp() {
+        let store = MemStore::new();
+        let old = store.add(new_memory("p1", "use sqlite")).await.unwrap();
+        let first = store.add(new_memory("p1", "use sqlite now")).await.unwrap();
+        let second = store.add(new_memory("p1", "use postgres")).await.unwrap();
+
+        let at = Utc::now();
+        store.supersede(old.id, Some(first.id), at).await.unwrap();
+
+        // A later invalidation must not move the earlier one: an `as_of`
+        // between the two instants would otherwise see a memory that was
+        // already dead.
+        let err = store
+            .supersede(old.id, Some(second.id), at + chrono::Duration::hours(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Mem8Error::InvalidInput(_)),
+            "a second supersede must be InvalidInput, got: {err:?}"
+        );
+
+        let got = store.get(old.id).await.unwrap();
+        assert_eq!(got.invalid_at, Some(at), "the original invalid_at must stand");
+        assert_eq!(
+            got.superseded_by,
+            Some(first.id),
+            "the original successor must stand"
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,10 @@
 name = "mem8"
 version = "0.1.0"
 edition = "2021"
+# `Option::is_none_or`, used by the store filter predicates, stabilised in
+# 1.82. Declared so an older toolchain reports an unmet MSRV instead of a
+# confusing "no method named `is_none_or`".
+rust-version = "1.82"
 description = "Persistent, project-scoped memory for AI coding agents, served over the Model Context Protocol."
 license = "MIT"
 repository = "https://github.com/rinnguyen711/mem8"
@@ -26,7 +30,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = "1"
+# `uuid1` and `chrono04` add `JsonSchema` for `Uuid` and `DateTime<Utc>`, which
+# schemars does not implement by default. The MCP tool parameters use both, and
+# taking them as bare `String` would emit an untyped string to the agent instead
+# of `format: "uuid"` / `format: "date-time"` — the schema is the only
+# documentation an agent reads, so the shape has to be in it.
+schemars = { version = "1", features = ["uuid1", "chrono04"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -68,6 +77,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 # stack, so the suite builds without OpenSSL headers.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
+# The migration suite hand-writes a v1 database, which needs the same SQLite
+# bindings the store uses. A normal dependency is not visible to integration
+# test targets, so it is repeated here with matching version and features.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 test-support = []

@@ -49,6 +49,20 @@ fn axis(n: usize) -> Vec<f32> {
     v
 }
 
+/// A vector at strictly increasing distance from `axis(0)` as `i` grows, so
+/// `ORDER BY distance ASC` has one unambiguous order.
+///
+/// `axis(0)` for every row would make all five distances 0 and leave the
+/// ordering to Postgres's discretion. A LIMIT test built on a tie proves
+/// nothing: whether the superseded rows occupy the first slots is then luck,
+/// and a naive Rust post-filter passes it.
+fn tilt(i: usize) -> Vec<f32> {
+    let mut v = vec![0.0; EMBEDDING_DIM];
+    v[0] = 1.0;
+    v[1 + i] = 0.01 * (i as f32 + 1.0);
+    v
+}
+
 fn memory(project: &str, content: &str, embedding: Option<Vec<f32>>) -> NewMemory {
     NewMemory {
         project: project.into(),
@@ -67,6 +81,8 @@ fn query(embedding: Vec<f32>, project: &str) -> VectorQuery {
         kind: None,
         tags: vec![],
         limit: 10,
+        include_superseded: false,
+        as_of: None,
     }
 }
 
@@ -369,4 +385,123 @@ async fn an_update_that_omits_the_embedding_keeps_the_stored_one() {
         "the embedding must survive an unrelated update"
     );
     assert!((hits[0].score - 1.0).abs() < 1e-5);
+}
+
+/// Semantic search must hide superseded facts exactly as keyword search does.
+///
+/// A `vector_search` that ignored supersession would surface dead facts that
+/// `search` correctly hides — the same memory reachable or not depending only
+/// on which search the caller happened to use.
+#[tokio::test]
+async fn vector_search_applies_the_temporal_predicate() {
+    let (store, p1) = store!();
+
+    let old = store
+        .add(memory(&p1, "storage is sqlite", Some(axis(0))))
+        .await
+        .unwrap();
+    let replacement = store
+        .add(memory(&p1, "storage is postgres", Some(axis(0))))
+        .await
+        .unwrap();
+
+    let at = old.created_at + chrono::Duration::seconds(10);
+    store
+        .supersede(old.id, Some(replacement.id), at)
+        .await
+        .unwrap();
+
+    // Default: hidden.
+    let live = store.vector_search(query(axis(0), &p1)).await.unwrap();
+    let live_ids: Vec<_> = live.iter().map(|h| h.memory.id).collect();
+    assert!(
+        !live_ids.contains(&old.id),
+        "vector_search must hide a superseded memory"
+    );
+    assert!(live_ids.contains(&replacement.id));
+
+    // include_superseded: both.
+    let both = store
+        .vector_search(VectorQuery {
+            include_superseded: true,
+            ..query(axis(0), &p1)
+        })
+        .await
+        .unwrap();
+    assert_eq!(both.len(), 2);
+
+    // as_of before the invalidation: the old fact was still believed. Offsets
+    // are whole seconds — TIMESTAMPTZ holds microseconds, so a sub-microsecond
+    // offset would compare differently here than in SQLite's nanosecond text.
+    let before = store
+        .vector_search(VectorQuery {
+            as_of: Some(old.created_at + chrono::Duration::seconds(5)),
+            ..query(axis(0), &p1)
+        })
+        .await
+        .unwrap();
+    assert!(
+        before.iter().any(|h| h.memory.id == old.id),
+        "as_of before the invalidation must include the old fact"
+    );
+
+    // Exactly at the invalidation it is already dead: the predicate is
+    // `invalid_at > T`.
+    let at_boundary = store
+        .vector_search(VectorQuery {
+            as_of: Some(at),
+            ..query(axis(0), &p1)
+        })
+        .await
+        .unwrap();
+    assert!(!at_boundary.iter().any(|h| h.memory.id == old.id));
+}
+
+/// The temporal predicate must be applied in SQL, before `LIMIT`.
+///
+/// `LIMIT` lives in the Postgres SQL (unlike SQLite, which truncates in Rust
+/// after tag filtering). A predicate applied in Rust instead would truncate to
+/// `limit` first and then remove superseded rows, so a limited search would
+/// return fewer than `limit` live hits whenever dead rows occupied slots.
+#[tokio::test]
+async fn vector_search_fills_the_limit_with_live_rows() {
+    let (store, p1) = store!();
+
+    let mut added = vec![];
+    for i in 0..5 {
+        added.push(
+            store
+                .add(memory(&p1, &format!("memory {i}"), Some(tilt(i))))
+                .await
+                .unwrap(),
+        );
+    }
+
+    // Supersede the two NEAREST rows, so they are exactly the ones an
+    // unfiltered `LIMIT 3` would return. With the predicate in SQL they are
+    // never selected and the limit fills with rows 2, 3 and 4; with a Rust
+    // post-filter the SQL returns rows 0, 1, 2 and the filter cuts it to one.
+    let at = added[0].created_at + chrono::Duration::seconds(10);
+    store.supersede(added[0].id, None, at).await.unwrap();
+    store.supersede(added[1].id, None, at).await.unwrap();
+
+    let hits = store
+        .vector_search(VectorQuery {
+            limit: 3,
+            ..query(axis(0), &p1)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        hits.len(),
+        3,
+        "LIMIT must be filled with live rows, not reduced by a post-filter"
+    );
+    assert!(hits.iter().all(|h| h.memory.invalid_at.is_none()));
+
+    // The three live rows, nearest first. Naming them pins the ordering as
+    // well as the count, so a tie could not satisfy this by accident.
+    let got: Vec<_> = hits.iter().map(|h| h.memory.id).collect();
+    assert_eq!(got, vec![added[2].id, added[3].id, added[4].id]);
 }

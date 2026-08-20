@@ -1,4 +1,4 @@
-use super::Store;
+use super::{truncate_for_storage, Store};
 use crate::error::{Mem8Error, Result};
 use crate::model::{Kind, Memory, MemoryUpdate, NewMemory, SearchHit, SearchQuery, VectorQuery};
 use async_trait::async_trait;
@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS memories (
@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS memories (
     tags        TEXT NOT NULL DEFAULT '[]',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
-    embedding   BLOB
+    embedding   BLOB,
+    superseded_by TEXT,
+    invalid_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_project ON memories(project);
 CREATE INDEX IF NOT EXISTS idx_project_kind ON memories(project, kind);
@@ -46,6 +48,23 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
 END;
 "#;
 
+/// Version 2: record that one fact replaced another.
+///
+/// Both columns are nullable and existing rows migrate to NULL/NULL, so every
+/// memory that exists today stays live and keeps being returned.
+///
+/// `invalid_at` is TEXT holding RFC3339, and the search predicates in Tasks 5-6
+/// compare it as text rather than parsing it. That is only correct while every
+/// writer uses plain `to_rfc3339()`, which renders UTC as `+00:00`. The `Z`
+/// form must NOT be used for these columns -- `to_rfc3339_opts(.., true)`
+/// included -- because `'Z'` (0x5A) sorts after `'+'` (0x2B), so the very same
+/// instant would compare as later than its `+00:00` spelling and an `as_of`
+/// boundary would silently flip. No existing test would catch it.
+const MIGRATE_V2: &[&str] = &[
+    "ALTER TABLE memories ADD COLUMN superseded_by TEXT",
+    "ALTER TABLE memories ADD COLUMN invalid_at TEXT",
+];
+
 pub struct SqliteStore {
     conn: Mutex<Connection>,
 }
@@ -68,7 +87,7 @@ impl SqliteStore {
         Self::init(conn)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA).map_err(store_err)?;
 
         let found: i32 = conn
@@ -81,9 +100,48 @@ impl SqliteStore {
                 expected: SCHEMA_VERSION,
             });
         }
+
         if found < SCHEMA_VERSION {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            // The ALTERs and the version bump share one transaction, so an
+            // interrupted upgrade leaves a v1 database rather than a
+            // half-migrated one. `CREATE TABLE IF NOT EXISTS` above is a no-op
+            // on an existing table, which is exactly why the columns cannot be
+            // added there and need a real migration step.
+            let tx = conn.transaction().map_err(store_err)?;
+            // `found == 0` is a brand-new database and `found == 1` a shipped
+            // v1 one; both need the v2 columns, which is why the guard is
+            // `< 2` rather than `== 1`. (`postgres.rs`'s `migrate` documents
+            // the same split via its `unwrap_or(1)`.)
+            if found < 2 {
+                for statement in MIGRATE_V2 {
+                    // Swallowing duplicate-column is load-bearing twice over,
+                    // so do not "simplify" it away:
+                    //
+                    // 1. A fresh database already got both columns from
+                    //    SCHEMA, so the ALTERs are *expected* to fail there.
+                    // 2. Two processes can open the same file at once. The
+                    //    loser sees the columns the winner already added, and
+                    //    treating that as success is what makes the race
+                    //    benign instead of failing one process's startup.
+                    //
+                    // Matched on the message because there is no typed
+                    // alternative: `duplicate column name` and `no such table`
+                    // are both bare `SQLITE_ERROR` with identical primary and
+                    // extended codes, so an extended-code match cannot tell
+                    // them apart and would swallow every ALTER failure
+                    // including a genuinely missing table. `starts_with`
+                    // rather than `contains`, so the match cannot be satisfied
+                    // by an unrelated error that merely quotes the phrase.
+                    match tx.execute(statement, []) {
+                        Ok(_) => {}
+                        Err(e) if e.to_string().starts_with("duplicate column name") => {}
+                        Err(e) => return Err(store_err(e)),
+                    }
+                }
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(store_err)?;
+            tx.commit().map_err(store_err)?;
         }
 
         Ok(Self {
@@ -125,6 +183,19 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| column_parse_error("updated_at", &updated, e))?;
 
+    let superseded_by = row
+        .get::<_, Option<String>>("superseded_by")?
+        .map(|s| Uuid::parse_str(&s).map_err(|e| column_parse_error("superseded_by", &s, e)))
+        .transpose()?;
+    let invalid_at = row
+        .get::<_, Option<String>>("invalid_at")?
+        .map(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| column_parse_error("invalid_at", &s, e))
+        })
+        .transpose()?;
+
     Ok(Memory {
         id: parsed_id,
         project: row.get("project")?,
@@ -134,6 +205,8 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
         created_at,
         updated_at,
         embedding: None,
+        superseded_by,
+        invalid_at,
     })
 }
 
@@ -150,6 +223,8 @@ impl Store for SqliteStore {
             created_at: now,
             updated_at: now,
             embedding: None,
+            superseded_by: None,
+            invalid_at: None,
         };
 
         let tags = serde_json::to_string(&memory.tags).map_err(store_err)?;
@@ -256,6 +331,29 @@ impl Store for SqliteStore {
             sql.push_str(&format!(" AND m.kind = ?{}", binds.len()));
         }
 
+        // Three modes, one predicate. `as_of` already specifies exactly which
+        // rows count, so it takes precedence over `include_superseded`; the
+        // tool boundary rejects a caller that sets both, but the store stays
+        // total over its input.
+        match query.as_of {
+            Some(t) => {
+                // Bound once: both comparisons must use the identical string,
+                // which is the property the text-ordering argument rests on.
+                let t_str = t.to_rfc3339();
+                binds.push(Box::new(t_str.clone()));
+                sql.push_str(&format!(" AND m.created_at <= ?{}", binds.len()));
+                binds.push(Box::new(t_str));
+                sql.push_str(&format!(
+                    " AND (m.invalid_at IS NULL OR m.invalid_at > ?{})",
+                    binds.len()
+                ));
+            }
+            None if !query.include_superseded => {
+                sql.push_str(" AND m.invalid_at IS NULL");
+            }
+            None => {}
+        }
+
         sql.push_str(" ORDER BY score");
 
         let conn = self.conn.lock().unwrap();
@@ -305,6 +403,10 @@ impl Store for SqliteStore {
     /// rather than an empty result is the point — an empty Vec would be
     /// indistinguishable from "nothing matched", and a caller would silently
     /// believe it had searched semantically when it had not.
+    ///
+    /// If this ever gains a real implementation, it must apply the identical
+    /// `as_of` / `include_superseded` predicate that `search` applies above,
+    /// so the two search paths agree on what counts as live.
     async fn vector_search(&self, _query: VectorQuery) -> Result<Vec<SearchHit>> {
         Err(Mem8Error::Unsupported {
             feature: "semantic search".into(),
@@ -323,6 +425,71 @@ impl Store for SqliteStore {
             feature: "storing embeddings".into(),
             backend: "the SQLite backend".into(),
         })
+    }
+
+    async fn supersede(&self, old: Uuid, new: Option<Uuid>, at: DateTime<Utc>) -> Result<()> {
+        // One statement sets both columns, so `invalid_at` is never set without
+        // the successor being decided in the same write. `new` may be NULL --
+        // known dead, successor unknown -- but the reverse (a successor with no
+        // invalidation time) is incoherent and unreachable from here.
+        //
+        // `AND invalid_at IS NULL` makes invalidation write-once. Without it a
+        // second call moves `invalid_at` forward, and every `as_of` query
+        // between the old and new instants starts seeing a memory that was
+        // already dead at that point -- an append-only temporal record silently
+        // rewritten. The guard lives in the WHERE clause rather than in a
+        // read-then-write, so two concurrent callers cannot both pass a check
+        // and then both write.
+        //
+        // `at` is written with plain `to_rfc3339()` (the `+00:00` form) because
+        // the search predicates compare this column as text. See MIGRATE_V2.
+        //
+        // Truncated to microseconds first. SQLite would happily keep all nine
+        // digits, but Postgres's TIMESTAMPTZ cannot, and a store-dependent
+        // precision makes the two disagree about an `as_of` between the
+        // truncated and full values. See `truncate_for_storage`.
+        //
+        // This UPDATE fires the unconditional `memories_au` FTS trigger, which
+        // deletes and re-inserts the row's FTS entry. Harmless -- `content` is
+        // unchanged, so the entry is rewritten identically -- and narrowing the
+        // trigger would mean changing shipped schema DDL for no behavioural
+        // gain.
+        let at = truncate_for_storage(at);
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE memories SET superseded_by = ?1, invalid_at = ?2
+                 WHERE id = ?3 AND invalid_at IS NULL",
+                params![
+                    new.map(|n| n.to_string()),
+                    at.to_rfc3339(),
+                    old.to_string()
+                ],
+            )
+            .map_err(store_err)?;
+
+        if changed == 0 {
+            // Zero rows now means either "no such memory" or "already
+            // superseded", and the caller needs to tell those apart: one is a
+            // bad id, the other a rejected duplicate. Re-read to decide.
+            let existing: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT invalid_at FROM memories WHERE id = ?1",
+                    params![old.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(store_err)?;
+
+            return match existing {
+                None => Err(Mem8Error::NotFound(old.to_string())),
+                Some(invalid_at) => Err(Mem8Error::InvalidInput(format!(
+                    "memory {old} is already superseded as of {}",
+                    invalid_at.unwrap_or_else(|| "an unknown time".into())
+                ))),
+            };
+        }
+        Ok(())
     }
 }
 
@@ -363,6 +530,8 @@ mod tests {
             kind: None,
             tags: vec![],
             limit: 10,
+            include_superseded: false,
+            as_of: None,
         }
     }
 
