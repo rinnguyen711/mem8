@@ -510,7 +510,12 @@ mod tests {
         let first = store.add(new_memory("p1", "use sqlite now")).await.unwrap();
         let second = store.add(new_memory("p1", "use postgres")).await.unwrap();
 
-        let at = Utc::now();
+        // Truncated to what the store will actually keep: `supersede` narrows
+        // the instant to microseconds so the two backends agree, and
+        // `Utc::now()` carries finer resolution on Linux and Windows than on
+        // macOS. Comparing against the raw instant would pass only on a clock
+        // whose sub-microsecond digits are already zero.
+        let at = truncate_for_storage(Utc::now());
         store.supersede(old.id, Some(first.id), at).await.unwrap();
 
         // A later invalidation must not move the earlier one: an `as_of`
@@ -532,6 +537,38 @@ mod tests {
             Some(first.id),
             "the original successor must stand"
         );
+    }
+
+    /// A stored invalidation is comparable against the truncated instant, not
+    /// the raw one, on every platform.
+    ///
+    /// The instant here is constructed with non-zero sub-microsecond digits
+    /// rather than sampled from the clock, because `Utc::now()` on macOS
+    /// already returns microsecond resolution — so a sampled instant makes this
+    /// vacuous there while Linux and Windows fail. That asymmetry is exactly
+    /// what broke CI once: a sibling test compared against the raw instant and
+    /// passed only on the developer's machine.
+    #[tokio::test]
+    async fn a_stored_invalidation_is_truncated_to_microseconds() {
+        use chrono::TimeZone;
+        let store = MemStore::new();
+        let old = store.add(new_memory("p1", "use sqlite")).await.unwrap();
+        let first = store.add(new_memory("p1", "use sqlite now")).await.unwrap();
+        let second = store.add(new_memory("p1", "use postgres")).await.unwrap();
+
+        // Non-zero sub-microsecond digits, exactly what CI's clock produces.
+        let raw = Utc.timestamp_nanos(1_787_197_906_743_519_789);
+        assert_ne!(truncate_for_storage(raw), raw, "probe must use a ragged instant");
+
+        let at = truncate_for_storage(raw);
+        store.supersede(old.id, Some(first.id), at).await.unwrap();
+        let err = store
+            .supersede(old.id, Some(second.id), at + chrono::Duration::hours(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Mem8Error::InvalidInput(_)));
+        let got = store.get(old.id).await.unwrap();
+        assert_eq!(got.invalid_at, Some(at), "the original invalid_at must stand");
     }
 
     #[tokio::test]

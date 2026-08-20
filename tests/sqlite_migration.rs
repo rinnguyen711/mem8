@@ -108,7 +108,11 @@ async fn superseding_twice_is_rejected_and_keeps_the_first_timestamp() {
     let first = add_decision(&store, "we chose postgres").await;
     let second = add_decision(&store, "we chose something else").await;
 
-    let at = chrono::Utc::now();
+    // Truncated to what the store keeps: `supersede` narrows the instant to
+    // microseconds so both backends agree, and `Utc::now()` carries finer
+    // resolution on Linux and Windows than on macOS. Comparing against the raw
+    // instant below would pass only where the sub-microsecond digits are zero.
+    let at = mem8::store::truncate_for_storage(chrono::Utc::now());
     store.supersede(original.id, Some(first.id), at).await.unwrap();
 
     let err = store
