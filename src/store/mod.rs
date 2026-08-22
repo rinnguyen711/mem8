@@ -531,7 +531,11 @@ mod tests {
         );
 
         let got = store.get(old.id).await.unwrap();
-        assert_eq!(got.invalid_at, Some(at), "the original invalid_at must stand");
+        assert_eq!(
+            got.invalid_at,
+            Some(at),
+            "the original invalid_at must stand"
+        );
         assert_eq!(
             got.superseded_by,
             Some(first.id),
@@ -558,7 +562,11 @@ mod tests {
 
         // Non-zero sub-microsecond digits, exactly what CI's clock produces.
         let raw = Utc.timestamp_nanos(1_787_197_906_743_519_789);
-        assert_ne!(truncate_for_storage(raw), raw, "probe must use a ragged instant");
+        assert_ne!(
+            truncate_for_storage(raw),
+            raw,
+            "probe must use a ragged instant"
+        );
 
         let at = truncate_for_storage(raw);
         store.supersede(old.id, Some(first.id), at).await.unwrap();
@@ -568,7 +576,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Mem8Error::InvalidInput(_)));
         let got = store.get(old.id).await.unwrap();
-        assert_eq!(got.invalid_at, Some(at), "the original invalid_at must stand");
+        assert_eq!(
+            got.invalid_at,
+            Some(at),
+            "the original invalid_at must stand"
+        );
     }
 
     #[tokio::test]

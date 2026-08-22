@@ -30,7 +30,12 @@ impl Server {
 
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self { child, stdin, stdout, next_id: 1 }
+        Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        }
     }
 
     fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -63,7 +68,10 @@ impl Server {
 
             let mut line = String::new();
             let read = self.stdout.read_line(&mut line).unwrap();
-            assert!(read > 0, "server closed stdout while awaiting a reply to {method}");
+            assert!(
+                read > 0,
+                "server closed stdout while awaiting a reply to {method}"
+            );
 
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
@@ -131,9 +139,13 @@ fn handshake_then_add_then_search_over_real_stdio() {
 
     // All five tools are advertised.
     let listed = server.request("tools/list", serde_json::json!({}));
-    let tools = listed["result"]["tools"].as_array().expect("tools/list returned no array");
-    let names: Vec<String> =
-        tools.iter().map(|t| t["name"].as_str().unwrap_or_default().to_string()).collect();
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .expect("tools/list returned no array");
+    let names: Vec<String> = tools
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+        .collect();
 
     for expected in [
         "add_memory",
@@ -142,7 +154,10 @@ fn handshake_then_add_then_search_over_real_stdio() {
         "update_memory",
         "delete_memory",
     ] {
-        assert!(names.contains(&expected.to_string()), "missing tool {expected} in {names:?}");
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing tool {expected} in {names:?}"
+        );
     }
 
     // `AddMemoryParams::kind` is now the real `Kind` enum, so schemars must
@@ -151,12 +166,20 @@ fn handshake_then_add_then_search_over_real_stdio() {
     // prose. Print the raw schema so `cargo test -- --nocapture` shows
     // exactly what schemars 1.x emits for a fieldless enum with
     // `#[serde(rename_all = "lowercase")]`.
-    let add_memory_tool =
-        tools.iter().find(|t| t["name"] == "add_memory").expect("add_memory tool must be listed");
+    let add_memory_tool = tools
+        .iter()
+        .find(|t| t["name"] == "add_memory")
+        .expect("add_memory tool must be listed");
     let input_schema = &add_memory_tool["inputSchema"];
     let kind_schema = &input_schema["properties"]["kind"];
-    println!("add_memory inputSchema:\n{}", serde_json::to_string_pretty(input_schema).unwrap());
-    println!("kind schema:\n{}", serde_json::to_string_pretty(kind_schema).unwrap());
+    println!(
+        "add_memory inputSchema:\n{}",
+        serde_json::to_string_pretty(input_schema).unwrap()
+    );
+    println!(
+        "kind schema:\n{}",
+        serde_json::to_string_pretty(kind_schema).unwrap()
+    );
 
     // schemars 1.x hoists the fieldless enum into `$defs` and leaves a
     // `$ref` on the field itself, so resolve the ref to reach the `enum`
@@ -251,12 +274,24 @@ fn handshake_then_add_then_search_over_real_stdio() {
             "arguments": { "content": "x", "kind": "banana", "project": "p1" }
         }),
     );
-    println!("invalid kind response:\n{}", serde_json::to_string_pretty(&bad_kind).unwrap());
-    assert!(bad_kind.get("error").is_some(), "expected a protocol-level error: {bad_kind}");
+    println!(
+        "invalid kind response:\n{}",
+        serde_json::to_string_pretty(&bad_kind).unwrap()
+    );
+    assert!(
+        bad_kind.get("error").is_some(),
+        "expected a protocol-level error: {bad_kind}"
+    );
     let message = bad_kind["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("banana"), "error message should name the bad value: {message}");
+    assert!(
+        message.contains("banana"),
+        "error message should name the bad value: {message}"
+    );
     for k in expected {
-        assert!(message.contains(k), "error message should still document '{k}': {message}");
+        assert!(
+            message.contains(k),
+            "error message should still document '{k}': {message}"
+        );
     }
 
     // Store a memory.
@@ -282,7 +317,10 @@ fn handshake_then_add_then_search_over_real_stdio() {
         }),
     );
     let text = serde_json::to_string(&found["result"]).unwrap();
-    assert!(text.contains("spawns the real binary"), "search returned: {text}");
+    assert!(
+        text.contains("spawns the real binary"),
+        "search returned: {text}"
+    );
 
     // Supersede it, over the real wire, and confirm search now returns only the
     // replacement while `get` still answers for the old id.

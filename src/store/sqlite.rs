@@ -460,11 +460,7 @@ impl Store for SqliteStore {
             .execute(
                 "UPDATE memories SET superseded_by = ?1, invalid_at = ?2
                  WHERE id = ?3 AND invalid_at IS NULL",
-                params![
-                    new.map(|n| n.to_string()),
-                    at.to_rfc3339(),
-                    old.to_string()
-                ],
+                params![new.map(|n| n.to_string()), at.to_rfc3339(), old.to_string()],
             )
             .map_err(store_err)?;
 

@@ -113,7 +113,10 @@ async fn superseding_twice_is_rejected_and_keeps_the_first_timestamp() {
     // resolution on Linux and Windows than on macOS. Comparing against the raw
     // instant below would pass only where the sub-microsecond digits are zero.
     let at = mem8::store::truncate_for_storage(chrono::Utc::now());
-    store.supersede(original.id, Some(first.id), at).await.unwrap();
+    store
+        .supersede(original.id, Some(first.id), at)
+        .await
+        .unwrap();
 
     let err = store
         .supersede(

@@ -69,32 +69,61 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
     assert_eq!(store.search(query("rust")).await.unwrap().len(), 1);
 
     // Global search crosses projects.
-    let global = SearchQuery { global: true, project: None, ..query("rust") };
+    let global = SearchQuery {
+        global: true,
+        project: None,
+        ..query("rust")
+    };
     assert_eq!(store.search(global).await.unwrap().len(), 2);
 
     // Kind filter.
     store
-        .add(new_memory("p1", Kind::Convention, "rust files use snake_case", &[]))
+        .add(new_memory(
+            "p1",
+            Kind::Convention,
+            "rust files use snake_case",
+            &[],
+        ))
         .await
         .unwrap();
-    let by_kind = SearchQuery { kind: Some(Kind::Convention), ..query("rust") };
+    let by_kind = SearchQuery {
+        kind: Some(Kind::Convention),
+        ..query("rust")
+    };
     assert_eq!(store.search(by_kind).await.unwrap().len(), 1);
 
     // Tag filter uses AND semantics.
     store
-        .add(new_memory("p1", Kind::Fact, "rust tooling notes", &["lang", "tools"]))
+        .add(new_memory(
+            "p1",
+            Kind::Fact,
+            "rust tooling notes",
+            &["lang", "tools"],
+        ))
         .await
         .unwrap();
-    let both = SearchQuery { tags: vec!["lang".into(), "tools".into()], ..query("rust") };
+    let both = SearchQuery {
+        tags: vec!["lang".into(), "tools".into()],
+        ..query("rust")
+    };
     assert_eq!(store.search(both).await.unwrap().len(), 1);
 
     // Limit is honoured.
-    let limited = SearchQuery { limit: 1, ..query("rust") };
+    let limited = SearchQuery {
+        limit: 1,
+        ..query("rust")
+    };
     assert_eq!(store.search(limited).await.unwrap().len(), 1);
 
     // Update changes content and bumps updated_at.
     let updated = store
-        .update(added.id, MemoryUpdate { content: Some("we chose go".into()), ..Default::default() })
+        .update(
+            added.id,
+            MemoryUpdate {
+                content: Some("we chose go".into()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(updated.content, "we chose go");
@@ -132,11 +161,19 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
     // match unrelated documents containing "auth" and "token" far apart;
     // quoting the term as a literal phrase avoids that.
     let hyphen_id = store
-        .add(new_memory("p3", Kind::Fact, "we use auth-token for login", &[]))
+        .add(new_memory(
+            "p3",
+            Kind::Fact,
+            "we use auth-token for login",
+            &[],
+        ))
         .await
         .unwrap();
     let hyphen_text = sanitize_fts_query("auth-token").unwrap();
-    let hyphen_query = SearchQuery { project: Some("p3".into()), ..query(&hyphen_text) };
+    let hyphen_query = SearchQuery {
+        project: Some("p3".into()),
+        ..query(&hyphen_text)
+    };
     let hyphen_hits = store.search(hyphen_query).await.unwrap();
     assert_eq!(hyphen_hits.len(), 1);
     assert_eq!(hyphen_hits[0].memory.id, hyphen_id.id);
@@ -148,11 +185,19 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
     // stem "run" finding exactly it proves the backends now agree rather
     // than the query happening to match on a bare substring.
     let stem_id = store
-        .add(new_memory("p4", Kind::Fact, "the team is running tests", &[]))
+        .add(new_memory(
+            "p4",
+            Kind::Fact,
+            "the team is running tests",
+            &[],
+        ))
         .await
         .unwrap();
     let stem_text = sanitize_fts_query("run").unwrap();
-    let stem_query = SearchQuery { project: Some("p4".into()), ..query(&stem_text) };
+    let stem_query = SearchQuery {
+        project: Some("p4".into()),
+        ..query(&stem_text)
+    };
     let stem_hits = store.search(stem_query).await.unwrap();
     assert_eq!(stem_hits.len(), 1);
     assert_eq!(stem_hits[0].memory.id, stem_id.id);
@@ -184,7 +229,10 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
         // fails `invalid_at > t_before`, since `t_before == at ==
         // invalid_at`. Fixed offsets from `old.created_at` sidestep that.)
         let at = old.created_at + chrono::Duration::seconds(10);
-        store.supersede(old.id, Some(replacement.id), at).await.unwrap();
+        store
+            .supersede(old.id, Some(replacement.id), at)
+            .await
+            .unwrap();
 
         // Hidden from search by default.
         let live = store.search(query("storage")).await.unwrap();
@@ -200,12 +248,21 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
 
         // include_superseded returns both.
         let both = store
-            .search(SearchQuery { include_superseded: true, ..query("storage") })
+            .search(SearchQuery {
+                include_superseded: true,
+                ..query("storage")
+            })
             .await
             .unwrap();
         let both_ids: Vec<_> = both.iter().map(|h| h.memory.id).collect();
-        assert!(both_ids.contains(&old.id), "include_superseded must still return the old fact");
-        assert!(both_ids.contains(&replacement.id), "include_superseded must return the replacement too");
+        assert!(
+            both_ids.contains(&old.id),
+            "include_superseded must still return the old fact"
+        );
+        assert!(
+            both_ids.contains(&replacement.id),
+            "include_superseded must return the replacement too"
+        );
 
         // The NotFound / InvalidInput split is the subtlest part of
         // `supersede`, so assert the variants rather than just `is_err()`:
@@ -238,7 +295,10 @@ pub async fn run_contract(store: &dyn Store, supports: Supports) {
         let t_before = old.created_at + chrono::Duration::seconds(5);
         let t_after = at + chrono::Duration::seconds(5);
 
-        let as_of = |t| SearchQuery { as_of: Some(t), ..query("storage") };
+        let as_of = |t| SearchQuery {
+            as_of: Some(t),
+            ..query("storage")
+        };
 
         // Before invalidation the old fact was still believed.
         let before = store.search(as_of(t_before)).await.unwrap();
@@ -341,13 +401,21 @@ async fn sqlite_open_creates_the_database_file() {
 
     let store = SqliteStore::open(&db_path).unwrap();
     let added = store
-        .add(new_memory("p1", Kind::Decision, "file backed store works", &[]))
+        .add(new_memory(
+            "p1",
+            Kind::Decision,
+            "file backed store works",
+            &[],
+        ))
         .await
         .unwrap();
     let got = store.get(added.id).await.unwrap();
     assert_eq!(got.content, "file backed store works");
 
-    assert!(db_path.exists(), "database file should exist on disk after open()");
+    assert!(
+        db_path.exists(),
+        "database file should exist on disk after open()"
+    );
 
     // Drop the store so the file handle is released before cleanup on
     // platforms that lock open files.
